@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import os
+import tempfile
 
 # The production default keeps 10 GiB of MemAvailable free before heavy stages start. Hosted CI
 # runners and laptops often have less, which would make every end-to-end test wait for memory.
 # Tests that check the default itself clear this variable explicitly. Subprocesses inherit it.
 os.environ.setdefault("CONJECTRA_MIN_AVAIL_RAM_MB", "256")
+
+# Keep default git mirrors / worktrees out of the developer's home directory.
+_TEST_ROOT = tempfile.mkdtemp(prefix="conjectra-tests-")
+os.environ.setdefault("CONJECTRA_SANDBOX_ROOT", os.path.join(_TEST_ROOT, "sandboxes"))
+os.environ.setdefault("CONJECTRA_WORKTREE_ROOT", os.path.join(_TEST_ROOT, "worktrees"))
 
 from conjectra.adapters import GenericAdapter, compute_hypothesis_fingerprint, register_adapter
 from conjectra.types import FidelityRung, HypothesisKind, HypothesisNode, ResearchGoal

@@ -127,7 +127,10 @@ def test_shared_clone_isolation_and_sparse_worktree_lifecycle(tmp_path: Path):
     assert _snapshot_git_dir(origin) == before
 
 
-def test_sandbox_disk_high_water_fallback():
+def test_sandbox_disk_high_water_fallback(monkeypatch: pytest.MonkeyPatch):
+    # Exercise the built-in default roots, not the per-session overrides set in conftest.
+    monkeypatch.delenv("CONJECTRA_SANDBOX_ROOT", raising=False)
+    monkeypatch.delenv("CONJECTRA_WORKTREE_ROOT", raising=False)
     sb_full = SandboxManager(disk_used_pct_fn=lambda _p: 86.0)
     sb_root, wt_root = sb_full.resolve_roots()
     assert sb_root == FALLBACK_SANDBOX_BASE
