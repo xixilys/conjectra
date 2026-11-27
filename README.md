@@ -1,170 +1,216 @@
-# Conjectra
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
+    <img alt="Conjectra — hypotheses in, audited evidence out. A zero-token control plane for multi-goal autonomous research." src="docs/assets/banner-light.svg" width="100%">
+  </picture>
+</p>
 
-**A zero-token control plane for multi-goal autonomous research.**
-You submit research goals against git repositories; Conjectra turns them into falsifiable
-hypotheses, runs every step as a short, isolated, single-attempt job, and keeps an append-only
-evidence ledger that says — with machine-checked receipts — what was confirmed, what was refuted,
-and what is merely unknown.
+<p align="center">
+  <a href="https://github.com/xixilys/conjectra/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/xixilys/conjectra/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <img alt="Python 3.10 – 3.13" src="https://img.shields.io/badge/python-3.10%20%E2%80%93%203.13-3776ab">
+  <img alt="Runtime dependencies: none (standard library only)" src="https://img.shields.io/badge/runtime%20deps-none-2ea44f">
+  <img alt="Platforms: Linux, macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-555">
+  <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">
+</p>
 
-The name comes from Karl Popper's *Conjectures and Refutations*: a hypothesis only counts when it
-survived a real attempt to kill it.
+<p align="center">
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#see-it-run">See it run</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#how-it-compares">Compare</a> ·
+  <a href="#documentation">Docs</a>
+</p>
 
-> Status: **alpha**. The runtime was extracted from a private deployment that runs several
-> research goals unattended in parallel; it is young, and APIs and the on-disk schema may still
-> change. Linux and macOS (POSIX) only.
+**Conjectra lets coding agents run research experiments unattended, while a deterministic
+controller that never calls a model decides what runs next, and an append-only ledger records, with
+receipts, what was actually *confirmed*, what was *refuted*, and what is still *unknown*.**
+
+You point it at a git repository and a metric. It turns the goal into falsifiable hypotheses, runs
+every step as a short, isolated, single-attempt job, attacks every result it confirms, and lets you
+(or another agent) pause, steer or take over at any moment without losing track.
+
+The name comes from Karl Popper's *Conjectures and Refutations*: a hypothesis only counts once it
+has survived a real attempt to kill it.
 
 ---
 
 ## Why
 
-LLM agents are good at writing code and bad at being honest about results. Long-running agent
-loops drift, forget what was already tried, quietly mark flaky runs as wins, review their own work,
-and burn tokens while doing nothing. Conjectra separates the two concerns:
+LLM agents are good at writing code and bad at being honest about results. Conjectra keeps the
+models doing the work and takes the decisions and the bookkeeping away from them:
 
-* **A deterministic controller decides.** It is a single daemon that never calls a model. It
-  schedules, fences, retries, prunes and records — in milliseconds, for zero tokens.
-* **Models only work.** Every model call is one bounded job (write code, review a diff, plan an
-  experiment) executed in an isolated git worktree, with a pinned model route and a hard timeout.
-  Its output is accepted only through evidence gates.
+| Long-running agent loops tend to… | Conjectra instead… |
+|---|---|
+| spend tokens deciding what to do next | decides with one deterministic daemon: **0 LLM tokens**, milliseconds per step |
+| call a flaky run a win, or a crash a refutation | keeps **engineering, scientific and audit verdicts apart**; infrastructure, environment and engineering failures are *failure domains*, never "refuted" |
+| grade their own homework | sends design, implementation and result reviews to a **different model family**, on read-only snapshots |
+| forget what was already tried | puts refuted routes in a **graveyard** that rejects duplicates, and automatically spawns **ablation + falsification** branches for every confirmed result |
+| let a late result overwrite your decision | **fences** every human intervention with a `human_epoch`; results from before it are rejected |
+| live and die inside one chat session | keeps all state in a SQLite WAL ledger: `overview` answers in **< 50 ms**, `takeover` writes a **< 3 KB** brief anyone can resume from |
 
-## Features
+## Quickstart
 
-* **Multi-goal scheduling** — many goals share one worker pool with guaranteed slots, elastic
-  borrowing, aging and a foreground reserve for interactive use.
-* **Falsification-first evidence ledger** — every stage emits an `EvidenceReceipt` with separate
-  *engineering*, *scientific* and *audit* verdicts plus a `FailureDomain`. Infrastructure hiccups,
-  environment mismatches and engineering bugs can never be recorded as "hypothesis refuted";
-  "tests passed" alone never counts as a scientific confirmation.
-* **Automatic ablation & falsification** — a confirmed result spawns its own ablation and stress
-  test branches; refuted routes go to a graveyard that de-duplicates future proposals.
-* **Cross-family blind review** — design, implementation and result reviews run on read-only
-  snapshots and are routed to a *different model family* than the author.
-* **Pluggable model backends** — Claude Code, Codex CLI, Gemini CLI, any OpenAI-compatible endpoint,
-  any command-line tool, or your own Python plugin. A deterministic `fake` backend makes the whole
-  pipeline testable offline.
-* **Policy-driven model routing** — one router validates every route against a provider catalog;
-  routing policies can be structured JSON or natural language
-  (`"theory work uses Opus xhigh, routine analysis uses gpt-5-codex high"`), with `HARD` vs
-  `SOFT_FALLBACK` semantics and quota awareness.
-* **Human-in-the-loop with fencing** — `pause`, `resume`, `rebalance_goals`, `update_objective`,
-  `prune_branch`, `focus`, `inject_hypothesis`, `override_verdict`, … are atomic SQLite
-  transactions that bump a `human_epoch`; late results from before the intervention are fenced off
-  instead of silently overwriting your decision.
-* **SubGoal portfolios & two-tier decisions** — complex goals can decompose into independent
-  `SubGoalNode` tracks with local metrics, dependency locks (`LOCKED_DEP` auto-unlock with
-  `sealed_sha` propagation), weighted non-starvation scheduling, wave-gated fast lanes, track-isolated
-  `TrackLead` reviews (`< 3 KB` digests), and portfolio-level `ApexDirector` actions (`spawn`,
-  `retune`, `merge`, `kill`, `sync`).
-* **Session-independent hand-off** — `overview` / `subgoals` / `inspect` answer in < 50 ms straight
-  from the WAL; `takeover` emits a < 3 KB brief that any human or agent can pick up from.
-* **Real job execution** — production runs go through [HyperQueue](https://github.com/It4innovations/hyperqueue)
-  with resource-aware placement (CPU, RAM, GPU, LLM pool slots); an `inline` mode runs everything
-  in-process for development.
-
-## Architecture
-
-```
-            you / an agent
-   submit-goal · intervene · overview · takeover
-                   │   (atomic SQLite tx + unix-socket wake)
-                   ▼
-┌──────────────────────────────────────────────────────────────┐
-│  ResearchController  — deterministic reactor, 0 LLM tokens   │
-│  propose ▸ fence (goal_version, human_epoch) ▸ lease ▸        │
-│  dispatch ▸ reconcile receipts ▸ prune / promote / escalate  │
-│        ResourceArbiter · ModelRouter · GoalManager           │
-└────────┬──────────────────────┬──────────────────────────────┘
-         │ single-attempt jobs  │ append-only evidence
-         ▼                      ▼
-┌──────────────────────┐  ┌───────────────────────────────────┐
-│ HyperQueue / inline  │  │ SQLite WAL ledger                 │
-│  StageRunner         │  │ goals · hypotheses · tasks ·      │
-│  ├ git worktree      │  │ receipts · reviews · plans ·      │
-│  ├ adapter command   │  │ interventions · leases · events   │
-│  └ backend plugin ───┼──┼─► claude_cli · codex_cli ·        │
-│     (model call)     │  │   gemini_cli · openai_compat ·    │
-└──────────────────────┘  │   command · fake · <yours>        │
-                          └───────────────────────────────────┘
-```
-
-A hypothesis moves through stages, each one a separate job:
-
-```
-PROPOSE → DESIGN_REVIEW → CODE → CPU_GATE → IMPL_REVIEW → EXP_SCREEN → EXP_CONFIRM → RESULT_REVIEW → RECONCILE
-                                    │                           │
-                          deterministic tests            F1 fast screen → F2 full confirm
-```
-
-More detail: [docs/architecture.md](docs/architecture.md) · [docs/concepts.md](docs/concepts.md)
-
-## Five-minute quickstart
-
-Requirements: Python ≥ 3.10, git. No API keys, no network, no HyperQueue needed for the demo.
+Requirements: **Python ≥ 3.10** and **git**. No API keys, no network, no HyperQueue, and no
+`pip install` needed for the demo (the runtime is standard-library only).
 
 ```bash
 git clone https://github.com/xixilys/conjectra && cd conjectra
-pip install -e .            # optional; the demo also runs straight from the checkout
-./examples/quickstart/run.sh
+./examples/quickstart/run.sh        # ~30 s, fully offline
 ```
+
+> On macOS, `/usr/bin/python3` may still be 3.9. Put a newer `python3` first on `PATH`
+> (Homebrew, pyenv, uv, conda…) or `pip install -e .` into a 3.10+ environment.
 
 The script builds a toy repository whose test prints `METRIC score=<value>`, registers the goal
-*"maximize score"*, runs the controller inline for ~20 s with a tiny offline plugin backend playing
-the engineer and the reviewers, then shows the ledger and pauses the goal:
+*"maximize score"*, runs the controller inline for 20 s with a tiny offline backend playing the
+engineer and the reviewers, prints the ledger, writes a takeover brief, and finally pauses the goal
+as a human would.
 
+## See it run
+
+<p align="center">
+  <img alt="Terminal recording of ./examples/quickstart/run.sh: 49 evidence receipts, 12 hypotheses confirmed, overview in a few milliseconds, a 1441-byte takeover brief, then a human pause that bumps human_epoch from 0 to 1" src="docs/assets/demo.svg" width="100%">
+</p>
+
+<sub>An unedited recording of the command above on a laptop (macOS, Python 3.13, no HyperQueue),
+made with asciinema + svg-term. Only the silent 20-second controller run is shortened to 2.5 s; every
+line and number is real output. Timing-dependent counts vary slightly from run to run.</sub>
+
+What happened in those 20 seconds:
+
+* **3 starting hypotheses grew to 12.** One came from `proposals.json`, two were seeded by the
+  project adapter. Confirmed results spawned their own `ABLATION` (does the change actually matter?)
+  and `FALSIFICATION` (can a stress test break it?) branches (4 of each), plus one refinement.
+* **49 evidence receipts**, one per finished job: code commits in isolated worktrees, deterministic
+  test gates, fast-screen and full-confirm experiments, implementation and result reviews, and
+  reconcile steps, each recorded with its own verdicts.
+* **`tokens=0/100000`**: the controller itself never spends tokens; here the backend is an offline
+  toy, so no job does either. With real backends, jobs draw from each goal's token budget.
+* **A human pause took effect instantly**: `status=PAUSED`, `human_epoch` 0 → 1. Any result started
+  before the pause is now fenced off instead of silently overwriting the decision.
+
+The toy backend always improves the code and its reviewers always pass, so every hypothesis being
+confirmed is expected here; the demo shows the *pipeline*, not a scientific result. Failures look
+like this instead. On a machine that could not provide the memory a test gate asked for, the ledger
+recorded:
+
+```json
+{"stage": "CPU_GATE", "process_status": "ENV_ERROR", "engineering_verdict": "SKIPPED",
+ "scientific_verdict": "UNKNOWN", "failure_domain": "ENV_CONFIG_MISMATCH",
+ "failure_reason": "MEM_BELOW_10GB_TIMEOUT", "evidence_validity": "MISSING_INPUT"}
 ```
+
+The environment failed, so the hypothesis is *unknown*, not *refuted*, and it stays eligible.
+
+<details>
+<summary>Plain-text output of the recording</summary>
+
+```text
+$ ./examples/quickstart/run.sh
+== 1. toy repo
+== 2. init ledger + submit goal
+submitted goal: demo-score
+accepted proposals: 1 | enqueued tasks: 1
+== 3. run the controller inline for a few seconds
 == 4. what happened
 goal demo-score: status=ACTIVE receipts=49 tokens=0/100000 human_epoch=0
+overview latency: 9.306 ms
 12 hypotheses; verdicts: {'CONFIRMED': 12}
   [     CONFIRMED] COMPETING_ROUTE  toy primary algorithmic improvement route
   [     CONFIRMED] PARAMETER_RACE   More Newton iterations
+  [     CONFIRMED] PARAMETER_RACE   toy parameter calibration race
   [     CONFIRMED] ABLATION         Ablation of More Newton iterations
+  [     CONFIRMED] ABLATION         Ablation of toy parameter calibration race
   [     CONFIRMED] FALSIFICATION    Falsification stress on More Newton iterations
-  ...
-recent evidence receipts by stage: {'CODE': 3, 'CPU_GATE': 5, 'IMPL_REVIEW': 1, 'EXP_SCREEN': 7, 'EXP_CONFIRM': 1, 'RESULT_REVIEW': 2, 'RECONCILE': 1}
-takeover brief: 1453 bytes
+recent receipts by stage: CODE=3 CPU_GATE=5 IMPL_REVIEW=1 EXP_SCREEN=7 EXP_CONFIRM=1 RESULT_REVIEW=2 RECONCILE=1
+takeover brief:     1441 bytes -> /tmp/conjectra/.conjectra-demo/takeover.md
 == 5. human intervention: pause the goal
 goal demo-score: status=PAUSED receipts=49 tokens=0/100000 human_epoch=1
+overview latency: 2.382 ms
+done.
 ```
 
-### Using it on your own repository
+</details>
+
+## How it works
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.svg">
+    <img alt="Architecture: you or an agent talk to a zero-token controller through atomic transactions; the controller dispatches single-attempt jobs (code, gates, reviews, experiments) in isolated worktrees; every job writes an evidence receipt to an append-only SQLite ledger, which the controller reconciles and you read through overview and takeover" src="docs/assets/how-it-works-light.svg" width="100%">
+  </picture>
+</p>
+
+A hypothesis moves through stages. Each stage is a separate job with its own resources, timeout and
+receipt; retries are new jobs, never in-place re-runs.
+
+```mermaid
+flowchart LR
+    P([PROPOSE]) --> DR[DESIGN_REVIEW] --> C[CODE] --> G{{CPU_GATE}} --> IR[IMPL_REVIEW]
+    IR --> S{{EXP_SCREEN}} --> F{{EXP_CONFIRM}} --> RR[RESULT_REVIEW] --> R{{RECONCILE}}
+    R -- CONFIRMED --> AB([ablation + falsification branches])
+    R -- REFUTED --> GY[(graveyard)]
+    AB -. new hypotheses .-> P
+```
+
+<sub>Rectangles are model jobs (reviews run on a different model family than the author);
+hexagons are deterministic: tests, experiments with parsed metrics, and ledger reconciliation.
+`F1` fast screens come before `F2` full confirmations.</sub>
+
+Under the hood:
+
+* **Multi-goal scheduling**: many goals share one worker pool with guaranteed slots, elastic
+  borrowing, aging and a foreground reserve for interactive use.
+* **Pluggable model backends**: Claude Code, Codex CLI, Gemini CLI, any OpenAI-compatible endpoint,
+  any command-line tool, or your own Python plugin. A deterministic `fake` backend makes the whole
+  pipeline testable offline.
+* **Policy-driven model routing**: one router validates every route against a provider catalog.
+  Policies can be structured JSON or natural language
+  (`"theory work uses Opus xhigh, routine analysis uses gpt-5-codex high"`), with `HARD` vs
+  `SOFT_FALLBACK` semantics and quota awareness.
+* **Human-in-the-loop**: `pause`, `resume`, `rebalance_goals`, `update_objective`, `prune_branch`,
+  `focus`, `inject_hypothesis`, `override_verdict` and more are atomic SQLite transactions.
+* **SubGoal portfolios**: complex goals can split into independent tracks with local metrics,
+  dependency locks, weighted non-starvation scheduling, per-track `TrackLead` reviews on `< 3 KB`
+  digests and portfolio-level `ApexDirector` actions (`spawn`, `retune`, `merge`, `kill`, `sync`).
+* **Real job execution**: production runs go through
+  [HyperQueue](https://github.com/It4innovations/hyperqueue) with resource-aware placement (CPU, RAM,
+  GPU, LLM pool slots) and host guards for memory and disk; `--mode inline` runs everything
+  in-process for development.
+
+More detail: [Architecture](docs/architecture.md) · [Concepts](docs/concepts.md)
+
+## Use it on your own repository
 
 ```bash
+pip install -e .                                    # or run ./bin/conjectra from the checkout
 conjectra init-pilot --no-ssh
-conjectra submit-goal --file my_goal.json          # see examples/quickstart/goal.json
-conjectra import-proposals --file proposals.json   # optional: your own hypotheses
+conjectra submit-goal --file my_goal.json           # see examples/quickstart/goal.json
+conjectra import-proposals --file proposals.json    # optional: your own hypotheses
 conjectra daemon --mode inline --propose-mode seeds --max-seconds 600
 conjectra overview
-conjectra subgoals --goal-id my-goal
 conjectra inspect --goal-id my-goal
 conjectra intervene --scope goal --goal-id my-goal --action pause --reason "need to look"
 conjectra takeover --goal-id my-goal --format markdown
 ```
 
 For real model calls, install the CLIs you want to use (`claude`, `codex`, `gemini`) or point the
-`openai_compat` backend at an endpoint, and drop `CONJECTRA_BACKEND_OVERRIDE`. For parallel
-production runs install HyperQueue (`hq` on `PATH`) and use `--mode hq` (the default).
-
-## Examples
+`openai_compat` backend at an endpoint, and unset `CONJECTRA_BACKEND_OVERRIDE`. For parallel
+production runs, install HyperQueue (`hq` on `PATH`) and use `--mode hq` (the default). Host guards
+(free RAM, disk high-water mark) are tuned for servers; see
+[Configuration](docs/configuration.md#host-guards) to relax them on a laptop.
 
 | Example | What it shows |
 |---|---|
-| [`examples/quickstart`](examples/quickstart) | Full offline closed loop on a toy repo, HITL pause, takeover brief |
+| [`examples/quickstart`](examples/quickstart) | Full offline closed loop on a toy repo, human pause, takeover brief |
 | [`examples/custom_backend`](examples/custom_backend) | Writing and registering a model backend plugin (code, env var, entry point) |
 | [`examples/custom_adapter`](examples/custom_adapter) | A project adapter that seeds hypotheses and parses domain metrics |
 
-## Documentation
-
-* [Concepts](docs/concepts.md) — goals, hypotheses, stages, receipts, verdicts, failure domains, epochs
-* [Architecture](docs/architecture.md) — components, data flow, fencing and recovery
-* [Backends](docs/backends.md) — the model/execution backend plugin interface
-* [Adapters](docs/adapters.md) — project adapters: seeds, commands, metric parsing
-* [Configuration](docs/configuration.md) — environment variables, provider catalog, quota files
-* [CLI reference](docs/cli.md)
-
 ## How it compares
 
-Conjectra is a *control plane*, not an agent. It is meant to sit above the coding agents you
-already use and below the human who owns the research question.
+Conjectra is a *control plane*, not an agent. It sits above the coding agents you already use and
+below the human who owns the research question.
 
 | | Conjectra | Agent frameworks (LangGraph, AutoGen, CrewAI, …) | Autonomous-research agents (e.g. AI-Scientist-style pipelines) | Workflow engines (Airflow, Prefect, Ray, HyperQueue) | Experiment trackers (MLflow, W&B) |
 |---|---|---|---|---|---|
@@ -176,21 +222,35 @@ already use and below the human who owns the research question.
 | Human interventions fenced against stale results | Built in (`human_epoch`) | DIY | — | Pause/kill | — |
 | Model backends | Pluggable (CLI, HTTP, command, Python) | Pluggable | Usually fixed | n/a | n/a |
 
-It is complementary to these tools: HyperQueue is the execution layer, any coding agent can be a
-backend, and metrics can still be logged to your tracker.
+It complements these tools: HyperQueue is the execution layer, any coding agent can be a backend,
+and metrics can still be logged to your tracker.
 
-## Project status & limitations
+## Documentation
 
-* Alpha; expect schema migrations between minor versions (they are additive and automatic so far).
-* POSIX only (uses `fcntl`, process groups, unix sockets).
+| Page | What's in it |
+|---|---|
+| [Concepts](docs/concepts.md) | goals, hypotheses, stages, receipts, verdicts, failure domains, epochs |
+| [Architecture](docs/architecture.md) | components, data flow, fencing and recovery |
+| [Backends](docs/backends.md) | the model / execution backend plugin interface |
+| [Adapters](docs/adapters.md) | project adapters: seeds, commands, metric parsing |
+| [Configuration](docs/configuration.md) | environment variables, provider catalog, quota files, host guards |
+| [CLI reference](docs/cli.md) | every `conjectra` subcommand |
+
+## Status & limitations
+
+* **Alpha.** The runtime was extracted from a private deployment that runs several research goals
+  unattended in parallel. APIs and the on-disk schema may still change; schema migrations so far
+  are additive and automatic.
+* POSIX only (Linux and macOS): it uses `fcntl`, process groups and unix sockets.
 * The default provider catalog (`conjectra/data/providers.json`) lists example model ids; adjust
   them to what your CLIs and gateways actually accept.
-* The natural-language policy compiler understands English and Chinese keywords.
+* The natural-language routing-policy compiler understands English and Chinese keywords.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Please report security issues privately as described in
-[SECURITY.md](SECURITY.md).
+[SECURITY.md](SECURITY.md). The README artwork is generated by `scripts/gen_readme_assets.py`; see
+[docs/assets/README.md](docs/assets/README.md) for how to re-record the demo.
 
 ## License
 

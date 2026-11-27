@@ -305,13 +305,21 @@ class HQRuntime:
             else self.arr_home / "reactor.sock"
         )
         self.notify_cli = list(notify_cli) if notify_cli else None
-        self.hq_bin = resolve_hq_bin(hq_bin)
+        # Resolve lazily: `--mode inline` never talks to HyperQueue, so a missing `hq` binary must
+        # only fail when an HQ command is actually issued.
+        self._hq_bin_arg = hq_bin
+        try:
+            self.hq_bin: str | None = resolve_hq_bin(hq_bin)
+        except FileNotFoundError:
+            self.hq_bin = None
         self.worker_resources = dict(worker_resources) if worker_resources is not None else None
 
         self._lock = threading.Lock()
         self._pending_deps: dict[int, dict[str, Any]] = {}
 
     def _base_cmd(self, *, json_mode: bool = True) -> list[str]:
+        if self.hq_bin is None:
+            self.hq_bin = resolve_hq_bin(self._hq_bin_arg)  # raises FileNotFoundError with guidance
         cmd = [self.hq_bin, "--server-dir", str(self.server_dir)]
         if json_mode:
             cmd.extend(["--output-mode", "json"])
