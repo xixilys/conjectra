@@ -28,6 +28,7 @@ from conjectra.interactive import (
     get_overview,
     get_plans,
     get_reviews,
+    get_subgoals,
     get_token_audit,
     inspect_state,
     intervene,
@@ -811,8 +812,20 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     res = inspect_state(
         args.arr_home,
         goal_id=args.goal_id,
+        subgoal_id=args.subgoal_id,
         hypothesis_id=args.hypothesis_id,
         workflow_id=args.workflow_id,
+        provider=args.provider,
+    )
+    _print_json(res)
+    return 0
+
+
+def _cmd_subgoals(args: argparse.Namespace) -> int:
+    res = get_subgoals(
+        args.arr_home,
+        goal_id=args.goal_id,
+        status=args.status,
         provider=args.provider,
     )
     _print_json(res)
@@ -1103,12 +1116,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_ov.add_argument("--provider", default="interactive")
     p_ov.set_defaults(func=_cmd_overview)
 
-    p_insp = sub.add_parser("inspect", parents=[common], help="Sub-50ms Goal/Hypothesis/Workflow inspection")
+    p_insp = sub.add_parser("inspect", parents=[common], help="Sub-50ms Goal/SubGoal/Hypothesis/Workflow inspection")
     p_insp.add_argument("--goal-id", default=None)
+    p_insp.add_argument("--subgoal-id", default=None)
     p_insp.add_argument("--hypothesis-id", default=None)
     p_insp.add_argument("--workflow-id", default=None)
     p_insp.add_argument("--provider", default="interactive")
     p_insp.set_defaults(func=_cmd_inspect)
+
+    p_sgs = sub.add_parser("subgoals", parents=[common], help="Sub-50ms SubGoal portfolio inspection from SQLite WAL")
+    p_sgs.add_argument("--goal-id", default=None)
+    p_sgs.add_argument("--status", default=None)
+    p_sgs.add_argument("--provider", default="interactive")
+    p_sgs.set_defaults(func=_cmd_subgoals)
 
     p_ta = sub.add_parser("token-audit", parents=[common], help="Audit real uncached vs cache tokens per Goal")
     p_ta.add_argument("--goal-id", default=None)
@@ -1123,7 +1143,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_to.set_defaults(func=_cmd_takeover)
 
     p_iv = sub.add_parser("intervene", parents=[common], help="Atomic HITL intervention + instant reactor.sock wake")
-    p_iv.add_argument("--scope", required=True, choices=["global", "goal", "branch", "workflow", "task"])
+    p_iv.add_argument("--scope", required=True, choices=["global", "goal", "subgoal", "branch", "workflow", "task"])
     p_iv.add_argument("--action", required=True)
     p_iv.add_argument("--goal-id", default=None)
     p_iv.add_argument("--target-id", default=None)

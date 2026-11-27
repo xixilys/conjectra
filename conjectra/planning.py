@@ -284,7 +284,7 @@ def is_reversible_f1_exploratory(
         for k in ("touches_holdout", "requires_paid_gpu", "paid_cloud_gpu", "irreversible")
     ):
         return False
-    if str(params.get("required_hardware") or "").strip().lower() == "cloud_gpu":
+    if str(params.get("required_hardware") or "").strip().lower() in ("cloud_gpu", "slurm_cluster"):
         return False
     norm_tags = {str(t).strip().lower() for t in hyp.tags if str(t).strip()}
     for extra_tag in params.get("tags", []) if isinstance(params.get("tags"), list) else []:
@@ -393,8 +393,8 @@ def validate_r1_fast_lane_contract(
         repo_path=repo_path or (goal.repo_path or None),
         require_existing_venv=False,
     )
-    if plan.required_hardware == "cloud_gpu":
-        res.failures.append("R1 fast lane prohibits cloud_gpu paid cloud hardware")
+    if plan.required_hardware in ("cloud_gpu", "slurm_cluster"):
+        res.failures.append(f"R1 fast lane prohibits {plan.required_hardware} external/cloud hardware")
     if not is_reversible_f1_exploratory(goal, hyp, ignore_explicit_design_review=True):
         res.failures.append("Hypothesis is not eligible for reversible F0/F1 fast-lane approval")
     res.passed = len(res.failures) == 0

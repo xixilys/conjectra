@@ -42,10 +42,14 @@ from conjectra.types import (
     LeadDecisionEnvelope,
     ProcessStatus,
     ResearchGoal,
+    ResourceSpec,
     ScientificRole,
     ScientificVerdict,
     StageKind,
     StageTask,
+    SubGoalKind,
+    SubGoalNode,
+    SubGoalStatus,
 )
 
 READY_QUEUE_WATERMARK_FACTOR = 1.5
@@ -337,11 +341,20 @@ def _db_record_valid_negative_knowledge(
     content = {
         "hypothesis_id": hypothesis.hypothesis_id,
         "parent_id": hypothesis.parent_id,
+        "subgoal_id": getattr(hypothesis, "subgoal_id", None),
         "generation": int(hypothesis.params.get("generation", 1)) if isinstance(hypothesis.params, Mapping) else 1,
         "mechanism": hypothesis.mechanism,
-        "primary_metric": goal.primary_metric,
+        "primary_metric": (
+            str(hypothesis.params.get("subgoal_local_metric") or "").strip()
+            if isinstance(hypothesis.params, Mapping) and str(hypothesis.params.get("subgoal_local_metric") or "").strip()
+            else goal.primary_metric
+        ),
         "measured_value": metric_val,
-        "baseline_value": goal.baseline_value,
+        "baseline_value": (
+            float(hypothesis.params.get("subgoal_baseline_value", 0.0))
+            if isinstance(hypothesis.params, Mapping) and str(hypothesis.params.get("subgoal_local_metric") or "").strip()
+            else goal.baseline_value
+        ),
         "root_cause": reason,
         "receipt_id": receipt.receipt_id,
         "stage": receipt.stage.value,
@@ -509,6 +522,25 @@ def validate_hypothesis_candidate(
         reasons.append("params must be a mapping")
     params = dict(raw.get("params") or {}) if isinstance(raw.get("params"), Mapping) else {}
 
+    raw_specs = params.get("spec_paths")
+    if raw_specs is not None:
+        spec_list = (
+            [str(raw_specs).strip()]
+            if isinstance(raw_specs, str)
+            else ([str(p).strip() for p in raw_specs if str(p).strip()] if isinstance(raw_specs, Sequence) else [])
+        )
+        if spec_list:
+            spec_gate = check_no_banned_access(
+                paths=spec_list,
+                extra_bans=extra_bans,
+                repo_path=goal.repo_path or None,
+            )
+            if not spec_gate.passed:
+                for fail in spec_gate.failures:
+                    reasons.append(f"spec_paths: {fail}")
+
+    eff_subgoal_id = str(raw.get("subgoal_id") or params.get("subgoal_id") or "").strip() or None
+
     fidelity_raw = raw.get("fidelity", FidelityRung.F1_FAST_SCREEN)
     try:
         fidelity = (
@@ -571,6 +603,7 @@ def validate_hypothesis_candidate(
         status=str(raw.get("status") or "PENDING"),
         scientific_verdict=sci_verdict,
         fingerprint=fp,
+        subgoal_id=eff_subgoal_id,
     )
     return ValidationResult(valid=True, reasons=[], normalized_node=node)
 
@@ -936,6 +969,7 @@ def _build_ai_propose_prompt(
     receipts: Sequence[EvidenceReceipt] | None = None,
     graveyard_entries: Sequence[Mapping[str, Any]] | None = None,
     knowledge_items: Sequence[Mapping[str, Any]] | None = None,
+    include_output_instructions: bool = True,
 ) -> str:
     by_id = {h.hypothesis_id: h for h in existing_hypotheses}
     latest_rcpt_by_hyp: dict[str, EvidenceReceipt] = {}
@@ -1009,7 +1043,7 @@ def _build_ai_propose_prompt(
                 valid_negative_lessons.append(dict(content))
 
     next_gen = (max_gen + 1) if existing_hypotheses else 1
-    return (
+    body = (
         "You are a readonly scientific hypothesis proposer for conjectra.\n"
         f"Project: {goal.project}\n"
         f"Goal: {goal.title} (goal_version={getattr(goal, 'version', 1)})\n"
@@ -1020,11 +1054,16 @@ def _build_ai_propose_prompt(
         f"Existing hypothesis lineage & measured F1/F2 metrics: {json.dumps(existing_summary)}\n"
         f"VALID_NEGATIVE / Refuted root-cause lessons: {json.dumps(valid_negative_lessons)}\n"
         f"Refuted graveyard count: {len(graveyard_fps)}\n"
-        f"Target evolution generation: {next_gen} (set params.generation={next_gen} and parent_id when building on an existing hypothesis).\n\n"
-        f"Return STRICT JSON ONLY (no prose) as a JSON array of up to {max_proposals} hypotheses.\n"
-        "Each object MUST have keys: kind (COMPETING_ROUTE|REFINEMENT|ABLATION|FALSIFICATION|PARAMETER_RACE), "
-        "parent_id (string or null), title, statement, mechanism, writable_paths (non-empty list within writable_prefixes), "
-        "params (object including generation), kill_criteria (non-empty list of strings), screen_cmd, confirm_cmd, acceptance_cmd.\n"
+        f"Target evolution generation: {next_gen} (set params.generation={next_gen} and parent_id when building on an existing hypothesis).\n"
+    )
+    if not include_output_instructions:
+        return body
+    return (
+        body
+        + f"\nReturn STRICT JSON ONLY (no prose) as a JSON array of up to {max_proposals} hypotheses.\n"
+        + "Each object MUST have keys: kind (COMPETING_ROUTE|REFINEMENT|ABLATION|FALSIFICATION|PARAMETER_RACE), "
+        + "parent_id (string or null), title, statement, mechanism, writable_paths (non-empty list within writable_prefixes), "
+        + "params (object including generation), kill_criteria (non-empty list of strings), screen_cmd, confirm_cmd, acceptance_cmd.\n"
     )
 
 
@@ -1217,6 +1256,204 @@ def run_one_shot_ai_proposer(
     return [], tot_in, tot_out, last_model, f"AI proposer failed: {'; '.join(errors_sub)}"
 
 
+_BOOKKEEPING_ONLY_TOKENS = frozenset(
+    {
+        "a",
+        "add",
+        "an",
+        "and",
+        "bookkeeping",
+        "branch",
+        "bump",
+        "catalog",
+        "changelog",
+        "checksum",
+        "comment",
+        "comments",
+        "commit",
+        "commits",
+        "digest",
+        "doc",
+        "docs",
+        "docstring",
+        "docstrings",
+        "documentation",
+        "edit",
+        "entries",
+        "entry",
+        "file",
+        "files",
+        "for",
+        "format",
+        "formatting",
+        "git",
+        "hash",
+        "hashes",
+        "header",
+        "headers",
+        "in",
+        "index",
+        "inventory",
+        "json",
+        "ledger",
+        "lint",
+        "log",
+        "logbook",
+        "logging",
+        "manifest",
+        "markdown",
+        "md",
+        "metadata",
+        "note",
+        "notes",
+        "of",
+        "on",
+        "only",
+        "pure",
+        "purely",
+        "readme",
+        "record",
+        "report",
+        "reports",
+        "sha",
+        "sha1",
+        "sha256",
+        "state",
+        "status",
+        "summary",
+        "sync",
+        "table",
+        "tag",
+        "tags",
+        "the",
+        "to",
+        "todo",
+        "track",
+        "tracking",
+        "txt",
+        "typo",
+        "typos",
+        "update",
+        "version",
+        "whitespace",
+        "write",
+        "yaml",
+    }
+)
+
+
+def _is_filler_contribution(text: str) -> bool:
+    """Return True if `direct_contribution` is empty or pure doc/hash bookkeeping."""
+    norm = " ".join(str(text or "").strip().lower().split())
+    if len(norm) < 4:
+        return True
+    tokens = [tok for tok in _TOKEN_SPLIT_RE.findall(norm) if tok]
+    if not tokens:
+        return True
+    if all(tok in _BOOKKEEPING_ONLY_TOKENS for tok in tokens):
+        return True
+    if re.search(r"\b(?:pure(?:ly)?\s+)?(?:doc|docs|documentation|hash|bookkeeping)\s+only\b", norm):
+        return True
+    return False
+
+
+def _resolve_subgoal_context(
+    raw: Mapping[str, Any],
+    goal: ResearchGoal,
+    by_id: Mapping[str, HypothesisNode],
+    db: Any,
+    *,
+    explicit_subgoal: SubGoalNode | None = None,
+    explicit_subgoal_id: str | None = None,
+) -> tuple[str | None, SubGoalNode | None, str | None]:
+    """Resolve `(subgoal_id, subgoal_node, error)` from explicit args, candidate, or parent."""
+    raw_params = raw.get("params") if isinstance(raw.get("params"), Mapping) else {}
+    eff_sg_id = (
+        str(
+            raw.get("subgoal_id")
+            or raw_params.get("subgoal_id")
+            or explicit_subgoal_id
+            or (explicit_subgoal.subgoal_id if explicit_subgoal is not None else "")
+        ).strip()
+        or None
+    )
+    parent_id = str(raw.get("parent_id") or "").strip() or None
+    if eff_sg_id is None and parent_id:
+        parent = by_id.get(parent_id)
+        if parent is None and db is not None and hasattr(db, "get_hypothesis"):
+            parent = db.get_hypothesis(parent_id)
+        if parent is not None and getattr(parent, "subgoal_id", None):
+            eff_sg_id = str(parent.subgoal_id).strip() or None
+
+    if eff_sg_id is None:
+        return None, None, None
+
+    if explicit_subgoal is not None and explicit_subgoal.subgoal_id == eff_sg_id:
+        if explicit_subgoal.goal_id != goal.goal_id:
+            return (
+                eff_sg_id,
+                None,
+                f"CROSS_GOAL_OWNERSHIP_VIOLATION: subgoal {eff_sg_id!r} belongs to {explicit_subgoal.goal_id!r}, not {goal.goal_id!r}",
+            )
+        return eff_sg_id, explicit_subgoal, None
+
+    if db is not None and hasattr(db, "get_goal_subgoal"):
+        try:
+            sg_node = db.get_goal_subgoal(goal.goal_id, eff_sg_id)
+            return eff_sg_id, sg_node, None
+        except ValueError as exc:
+            return eff_sg_id, None, f"CROSS_GOAL_OWNERSHIP_VIOLATION: {exc}"
+    if db is not None and hasattr(db, "get_subgoal"):
+        sg_node = db.get_subgoal(eff_sg_id)
+        if sg_node is not None and sg_node.goal_id != goal.goal_id:
+            return (
+                eff_sg_id,
+                None,
+                f"CROSS_GOAL_OWNERSHIP_VIOLATION: subgoal {eff_sg_id!r} belongs to {sg_node.goal_id!r}, not {goal.goal_id!r}",
+            )
+        return eff_sg_id, sg_node, None
+    return eff_sg_id, None, None
+
+
+def _propagate_subgoal_fields_to_candidate(
+    cand: dict[str, Any],
+    sg_id: str,
+    sg_node: SubGoalNode | None,
+) -> dict[str, Any]:
+    """Propagate SubGoal base_sha, spec_paths, and local_metric metadata onto a candidate dict."""
+    out = dict(cand)
+    out["subgoal_id"] = sg_id
+    cparams = dict(out.get("params") or {}) if isinstance(out.get("params"), Mapping) else {}
+    cparams.setdefault("subgoal_id", sg_id)
+    if sg_node is not None:
+        if sg_node.base_sha and not str(out.get("base_sha") or "").strip():
+            out["base_sha"] = sg_node.base_sha
+        if sg_node.spec_paths:
+            prev_specs = cparams.get("spec_paths")
+            prev_list = (
+                [str(prev_specs).strip()]
+                if isinstance(prev_specs, str)
+                else (
+                    [str(s).strip() for s in prev_specs if str(s).strip()]
+                    if isinstance(prev_specs, Sequence)
+                    else []
+                )
+            )
+            cparams["spec_paths"] = list(dict.fromkeys([*prev_list, *sg_node.spec_paths]))
+        local_m = str(sg_node.local_metric or "").strip()
+        if local_m:
+            cparams.setdefault("subgoal_local_metric", local_m)
+            cparams.setdefault("subgoal_baseline_value", float(sg_node.baseline_value))
+            cparams.setdefault("subgoal_direction", str(sg_node.direction or "maximize"))
+            if sg_node.kill_criteria:
+                cparams.setdefault("subgoal_kill_criteria", list(sg_node.kill_criteria))
+                if not out.get("kill_criteria"):
+                    out["kill_criteria"] = list(sg_node.kill_criteria)
+        cparams.setdefault("wave_gated", bool(sg_node.wave_gated))
+    out["params"] = cparams
+    return out
+
+
 def _ingest_raw_candidates(
     goal: ResearchGoal,
     raw_candidates: Sequence[Mapping[str, Any]],
@@ -1233,6 +1470,8 @@ def _ingest_raw_candidates(
     in_tokens: int = 0,
     out_tokens: int = 0,
     model_used: str = "",
+    subgoal_id: str | None = None,
+    subgoal: SubGoalNode | None = None,
 ) -> ProposalBatchResult:
     existing = (
         list(existing_hypotheses)
@@ -1287,13 +1526,35 @@ def _ingest_raw_candidates(
         )
 
     existing_fps = {h.fingerprint.strip().lower() for h in existing if h.fingerprint}
+    by_id: dict[str, HypothesisNode] = {h.hypothesis_id: h for h in existing}
     seen_fps: set[str] = set()
     valid_nodes: list[HypothesisNode] = []
     rejected: list[dict[str, Any]] = []
 
     for raw in raw_candidates:
+        cand = dict(raw)
+        eff_sg_id, sg_node, sg_err = _resolve_subgoal_context(
+            cand,
+            goal,
+            by_id,
+            db,
+            explicit_subgoal=subgoal,
+            explicit_subgoal_id=subgoal_id,
+        )
+        if sg_err:
+            rejected.append(
+                {
+                    "hypothesis_id": str(cand.get("hypothesis_id") or ""),
+                    "title": str(cand.get("title") or "<untitled>"),
+                    "reasons": [sg_err],
+                }
+            )
+            continue
+        if eff_sg_id:
+            cand = _propagate_subgoal_fields_to_candidate(cand, eff_sg_id, sg_node)
+
         vr = validate_hypothesis_candidate(
-            raw,
+            cand,
             goal,
             existing_fingerprints=existing_fps | seen_fps,
             graveyard_fingerprints=graveyard,
@@ -1301,13 +1562,37 @@ def _ingest_raw_candidates(
         if not vr.valid or vr.normalized_node is None:
             rejected.append(
                 {
-                    "hypothesis_id": str(raw.get("hypothesis_id") or ""),
-                    "title": str(raw.get("title") or "<untitled>"),
+                    "hypothesis_id": str(cand.get("hypothesis_id") or ""),
+                    "title": str(cand.get("title") or "<untitled>"),
                     "reasons": vr.reasons,
                 }
             )
             continue
         node = vr.normalized_node
+        if eff_sg_id:
+            gen = _hypothesis_generation(node, by_id)
+            parent_node = by_id.get(node.parent_id) if node.parent_id else None
+            if sg_node is not None:
+                max_auto_gen = int(getattr(sg_node, "max_auto_generations", 1))
+            elif parent_node is not None and isinstance(parent_node.params, Mapping) and parent_node.params.get("max_auto_generations") is not None:
+                max_auto_gen = int(parent_node.params["max_auto_generations"])
+            elif isinstance(node.params, Mapping) and node.params.get("max_auto_generations") is not None:
+                max_auto_gen = int(node.params["max_auto_generations"])
+            else:
+                max_auto_gen = 1
+            if gen > max_auto_gen:
+                rejected.append(
+                    {
+                        "hypothesis_id": node.hypothesis_id,
+                        "title": node.title,
+                        "subgoal_id": eff_sg_id,
+                        "reasons": [
+                            f"SUBGOAL_GENERATION_CAP_REACHED (generation={gen} > max_auto_generations={max_auto_gen} for subgoal {eff_sg_id})"
+                        ],
+                    }
+                )
+                continue
+
         if _db_is_in_graveyard(db, node.fingerprint, goal_id=goal.goal_id):
             rejected.append(
                 {
@@ -1320,6 +1605,7 @@ def _ingest_raw_candidates(
         node.priority_evoi = compute_evoi(goal, node, existing + valid_nodes)
         seen_fps.add(node.fingerprint)
         valid_nodes.append(node)
+        by_id[node.hypothesis_id] = node
 
     ranked, low_evoi_rejected = rank_candidates_by_evoi(valid_nodes, min_evoi=min_evoi)
     rejected.extend(low_evoi_rejected)
@@ -1366,6 +1652,8 @@ def import_proposals_json(
     min_evoi: float = DEFAULT_MIN_EVOI,
     persist: bool = True,
     source: str = "external_json",
+    subgoal_id: str | None = None,
+    subgoal: SubGoalNode | None = None,
 ) -> ProposalBatchResult:
     """Validate, deduplicate, EVOI-rank, and optionally persist proposals from /teamwork or run_workflow."""
     try:
@@ -1389,6 +1677,8 @@ def import_proposals_json(
         min_evoi=min_evoi,
         persist=persist,
         source=source,
+        subgoal_id=subgoal_id,
+        subgoal=subgoal,
     )
 
 
@@ -1410,6 +1700,8 @@ def propose_hypotheses(
     ai_timeout_s: int = 300,
     subprocess_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     persist: bool = True,
+    subgoal_id: str | None = None,
+    subgoal: SubGoalNode | None = None,
 ) -> ProposalBatchResult:
     """Propose validated hypotheses via deterministic seeds, one-shot AI, or external JSON import."""
     if external_proposals is not None or mode == "import":
@@ -1432,6 +1724,8 @@ def propose_hypotheses(
             min_evoi=min_evoi,
             persist=persist,
             source="external_json",
+            subgoal_id=subgoal_id,
+            subgoal=subgoal,
         )
 
     existing = (
@@ -1523,6 +1817,8 @@ def propose_hypotheses(
         in_tokens=in_tok,
         out_tokens=out_tok,
         model_used=model_used,
+        subgoal_id=subgoal_id,
+        subgoal=subgoal,
     )
     if extra_rejected:
         batch.rejected = extra_rejected + batch.rejected
@@ -1726,6 +2022,7 @@ def _spawn_ablation_and_falsification(
             "confirm_cmd": parent.confirm_cmd,
             "branch_name": f"arr/{goal.project}/{hid}",
             "base_sha": parent.head_sha or parent.base_sha,
+            "subgoal_id": getattr(parent, "subgoal_id", None),
             "status": "PENDING",
         }
         vr = validate_hypothesis_candidate(
@@ -1780,6 +2077,7 @@ def _spawn_diagnostic_refinement(
         "confirm_cmd": parent.confirm_cmd,
         "branch_name": f"arr/{goal.project}/{hid}",
         "base_sha": parent.head_sha or parent.base_sha,
+        "subgoal_id": getattr(parent, "subgoal_id", None),
         "status": "PENDING",
     }
     vr = validate_hypothesis_candidate(
@@ -2325,6 +2623,54 @@ def _validate_envelope_goal_ownership(
         _check_wf_id(act_name, params.get("parent_workflow_id"), "parameters.parent_workflow_id")
         _check_task_id(act_name, params.get("task_id"), "parameters.task_id")
 
+        def _check_subgoal_id(raw_sgid: Any, field_name: str) -> None:
+            if not raw_sgid:
+                return
+            sgid_s = str(raw_sgid).strip()
+            if not sgid_s:
+                return
+            if hasattr(db, "get_goal_subgoal"):
+                try:
+                    db.get_goal_subgoal(goal.goal_id, sgid_s)
+                except ValueError as exc:
+                    violations.append(
+                        {
+                            "action": act_name,
+                            "field": field_name,
+                            "subgoal_id": sgid_s,
+                            "reason": f"CROSS_GOAL_OWNERSHIP_VIOLATION: {exc}",
+                        }
+                    )
+            elif hasattr(db, "get_subgoal"):
+                sg_obj = db.get_subgoal(sgid_s)
+                if sg_obj is not None and sg_obj.goal_id != goal.goal_id:
+                    violations.append(
+                        {
+                            "action": act_name,
+                            "field": field_name,
+                            "subgoal_id": sgid_s,
+                            "reason": (
+                                f"CROSS_GOAL_OWNERSHIP_VIOLATION: {field_name}={sgid_s!r} belongs to "
+                                f"goal {sg_obj.goal_id!r}, not {goal.goal_id!r}"
+                            ),
+                        }
+                    )
+
+        sg_map = params.get("subgoal") if isinstance(params.get("subgoal"), Mapping) else {}
+        _check_subgoal_id(act.target_subgoal_id, "target_subgoal_id")
+        _check_subgoal_id(params.get("subgoal_id"), "parameters.subgoal_id")
+        _check_subgoal_id(params.get("target_subgoal_id"), "parameters.target_subgoal_id")
+        _check_subgoal_id(params.get("upstream_subgoal_id"), "parameters.upstream_subgoal_id")
+        _check_subgoal_id(sg_map.get("subgoal_id"), "subgoal.subgoal_id")
+        _check_subgoal_id(prop.get("subgoal_id"), "proposal.subgoal_id")
+        for seq_sg_key in ("source_subgoal_ids", "subgoal_ids", "depends_on_subgoals", "reallocate_to"):
+            raw_sg_seq = params.get(seq_sg_key)
+            if isinstance(raw_sg_seq, str):
+                _check_subgoal_id(raw_sg_seq, f"parameters.{seq_sg_key}")
+            elif isinstance(raw_sg_seq, Sequence) and not isinstance(raw_sg_seq, (str, bytes)):
+                for item_sgid in raw_sg_seq:
+                    _check_subgoal_id(item_sgid, f"parameters.{seq_sg_key}")
+
         eff_target_hid = str(act.target_hypothesis_id or params.get("hypothesis_id") or "").strip()
         for nested_label, nested_map in (
             ("parameters.experiment_plan", params.get("experiment_plan")),
@@ -2534,8 +2880,9 @@ def apply_scientific_actions(
     workflow_runtime: Any = None,
     source: str = "research_lead",
     raise_on_cross_goal: bool = False,
+    scoped_subgoal_id: str | None = None,
 ) -> dict[str, Any]:
-    """Execute all 13 typed closed-loop `ActionKind`s emitted by ResearchLead / ResearchDirector."""
+    """Execute all typed closed-loop `ActionKind`s emitted by ResearchLead / ResearchDirector."""
     summary: dict[str, Any] = {
         "role": envelope.role.value,
         "uncertainty_summary": envelope.uncertainty_summary,
@@ -2553,10 +2900,33 @@ def apply_scientific_actions(
         "syntheses_recorded": 0,
         "synthesis_review_workflows": [],
         "continued": 0,
+        "spawned_subgoal_ids": [],
+        "retuned_subgoal_ids": [],
+        "merged_subgoal_ids": [],
+        "killed_subgoal_ids": [],
+        "synced_subgoal_ids": [],
         "cross_goal_violation": False,
         "rejected": [],
     }
     tx_cm = db._tx() if hasattr(db, "_tx") else None
+    eff_scoped_sg_id = (
+        str(scoped_subgoal_id).strip()
+        if scoped_subgoal_id and str(scoped_subgoal_id).strip()
+        else (
+            str((envelope.metadata or {}).get("subgoal_id") or "").strip() or None
+            if envelope.role == ScientificRole.RESEARCH_LEAD
+            else None
+        )
+    )
+    _APEX_ONLY_ACTIONS = frozenset(
+        {
+            ActionKind.SPAWN_SUBGOAL,
+            ActionKind.RETUNE_SUBGOAL,
+            ActionKind.MERGE_SUBGOALS,
+            ActionKind.KILL_AND_REALLOCATE,
+            ActionKind.SYNC_SUBGOAL_BASE,
+        }
+    )
 
     def _run_in_tx() -> dict[str, Any]:
         violations = _validate_envelope_goal_ownership(db, goal, envelope)
@@ -2568,6 +2938,84 @@ def apply_scientific_actions(
             return summary
 
         plan_mgr = PlanLifecycleManager(db) if hasattr(db, "save_research_plan") else None
+        no_dispatch_revised: set[str] = set()
+
+        def _get_goal_sg(sg_id_val: str) -> SubGoalNode | None:
+            if not sg_id_val:
+                return None
+            if hasattr(db, "get_goal_subgoal"):
+                return db.get_goal_subgoal(goal.goal_id, sg_id_val)
+            if hasattr(db, "get_subgoal"):
+                sg_cand = db.get_subgoal(sg_id_val)
+                return sg_cand if (sg_cand is not None and sg_cand.goal_id == goal.goal_id) else None
+            return None
+
+        def _sync_active_task_epochs(
+            next_pe: int,
+            *,
+            cancel_hids: set[str] | None = None,
+            cancel_reason: str = "",
+            now_ts: float,
+        ) -> None:
+            if not hasattr(db, "list_tasks"):
+                return
+            c_set = cancel_hids or set()
+            for t_obj in db.list_tasks(goal_id=goal.goal_id):
+                if t_obj.status not in ("READY", "DISPATCHED", "RUNNING"):
+                    continue
+                if t_obj.hypothesis_id in c_set:
+                    try:
+                        db.transition_task_status(
+                            t_obj.task_id,
+                            ("READY", "DISPATCHED", "RUNNING"),
+                            "CANCELLED",
+                            finished_ts=now_ts,
+                            now=now_ts,
+                        )
+                        if t_obj.hq_job_id is not None and hasattr(db, "record_pending_hq_cancellation"):
+                            db.record_pending_hq_cancellation(
+                                hq_job_id=int(t_obj.hq_job_id),
+                                entity_kind="task",
+                                entity_id=t_obj.task_id,
+                                attempt=int(t_obj.attempt),
+                                goal_id=goal.goal_id,
+                                hypothesis_id=t_obj.hypothesis_id,
+                                workflow_id=t_obj.workflow_id or "",
+                                epoch=int(goal.human_epoch),
+                                plan_epoch=next_pe,
+                                reason=cancel_reason,
+                                state="CANCEL_PENDING",
+                                now=now_ts,
+                            )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        synced_route = (
+                            {
+                                **dict(t_obj.pinned_route),
+                                "plan_epoch": next_pe,
+                                "exec_fence_plan_epoch": next_pe,
+                                "exec_fence_human_epoch": int(goal.human_epoch),
+                            }
+                            if isinstance(t_obj.pinned_route, Mapping)
+                            else {
+                                "plan_epoch": next_pe,
+                                "exec_fence_plan_epoch": next_pe,
+                                "exec_fence_human_epoch": int(goal.human_epoch),
+                            }
+                        )
+                        db.transition_task_status(
+                            t_obj.task_id,
+                            t_obj.status,
+                            t_obj.status,
+                            plan_epoch=next_pe,
+                            human_epoch=int(goal.human_epoch),
+                            pinned_route=synced_route,
+                            now=now_ts,
+                        )
+                    except Exception:
+                        pass
 
         for act in envelope.actions:
             kind = act.action
@@ -2580,6 +3028,38 @@ def apply_scientific_actions(
                 target_hyp = cand_h if (cand_h is not None and cand_h.goal_id == goal.goal_id) else None
             else:
                 target_hyp = None
+
+            if envelope.role == ScientificRole.RESEARCH_LEAD and eff_scoped_sg_id:
+                if kind in _APEX_ONLY_ACTIONS:
+                    summary["rejected"].append(
+                        {
+                            "action": kind.value,
+                            "subgoal_id": eff_scoped_sg_id,
+                            "reason": f"TRACK_LEAD_FORBIDDEN_PORTFOLIO_ACTION: {kind.value} requires Apex ResearchDirector",
+                        }
+                    )
+                    continue
+                if act.target_subgoal_id and str(act.target_subgoal_id).strip() != eff_scoped_sg_id:
+                    summary["rejected"].append(
+                        {
+                            "action": kind.value,
+                            "subgoal_id": str(act.target_subgoal_id),
+                            "reason": f"CROSS_SUBGOAL_MUTATION_FORBIDDEN: TrackLead scoped to {eff_scoped_sg_id!r}",
+                        }
+                    )
+                    continue
+                if target_hyp is not None and getattr(target_hyp, "subgoal_id", None) != eff_scoped_sg_id:
+                    summary["rejected"].append(
+                        {
+                            "action": kind.value,
+                            "hypothesis_id": target_hyp.hypothesis_id,
+                            "reason": (
+                                f"CROSS_SUBGOAL_MUTATION_FORBIDDEN: hypothesis {target_hyp.hypothesis_id!r} "
+                                f"belongs to subgoal {getattr(target_hyp, 'subgoal_id', None)!r}, not {eff_scoped_sg_id!r}"
+                            ),
+                        }
+                    )
+                    continue
 
             if kind == ActionKind.CONTINUE:
                 summary["continued"] += 1
@@ -2752,6 +3232,28 @@ def apply_scientific_actions(
                                     "preserved_receipt_ids": node_pres,
                                 },
                             )
+                if params.get("dispatch") is False:
+                    no_dispatch_revised.add(target_hyp.hypothesis_id)
+                field_updates: dict[str, str] = {}
+                for str_field in ("statement", "mechanism", "acceptance_cmd", "screen_cmd", "confirm_cmd"):
+                    if isinstance(params.get(str_field), str) and str(params[str_field]).strip():
+                        cand_val = str(params[str_field]).strip()
+                        if str_field.endswith("_cmd"):
+                            cmd_chk = check_no_banned_access(
+                                command=cand_val,
+                                branch_name=target_hyp.branch_name,
+                                extra_bans=goal.banned_paths,
+                            )
+                            if not cmd_chk.passed:
+                                continue
+                        setattr(target_hyp, str_field, cand_val)
+                        field_updates[str_field] = cand_val
+                if field_updates and hasattr(db, "update_hypothesis_fields"):
+                    target_hyp = db.update_hypothesis_fields(
+                        target_hyp.hypothesis_id, field_updates, now=now_rev
+                    )
+                elif field_updates:
+                    _db_register_or_update_hypothesis(db, target_hyp, prev_status=target_hyp.status)
                 if plan_mgr is not None and isinstance(params.get("experiment_plan"), Mapping):
                     raw_ep_map = dict(params["experiment_plan"])
                     whitelisted_ep = {
@@ -2806,12 +3308,37 @@ def apply_scientific_actions(
                 if act.uncertainty_id:
                     raw_prop["uncertainty_id"] = act.uncertainty_id
 
+                explicit_prop_sg = str(
+                    raw_prop.get("subgoal_id")
+                    or cparams.get("subgoal_id")
+                    or act.target_subgoal_id
+                    or ""
+                ).strip() or None
+                if (
+                    envelope.role == ScientificRole.RESEARCH_LEAD
+                    and eff_scoped_sg_id
+                    and explicit_prop_sg
+                    and explicit_prop_sg != eff_scoped_sg_id
+                ):
+                    summary["rejected"].append(
+                        {
+                            "action": kind.value,
+                            "subgoal_id": explicit_prop_sg,
+                            "reason": f"CROSS_SUBGOAL_MUTATION_FORBIDDEN: TrackLead scoped to {eff_scoped_sg_id!r}",
+                        }
+                    )
+                    continue
+                target_prop_sg_id = eff_scoped_sg_id or explicit_prop_sg
+                if target_prop_sg_id:
+                    raw_prop["subgoal_id"] = target_prop_sg_id
+
                 batch = import_proposals_json(
                     goal,
                     [raw_prop],
                     db=db,
                     persist=True,
                     source=source,
+                    subgoal_id=target_prop_sg_id,
                 )
                 for h in batch.accepted:
                     if hasattr(db, "update_hypothesis_v3_state") and (raw_prop.get("tags") or act.uncertainty_id):
@@ -2901,6 +3428,25 @@ def apply_scientific_actions(
                     for x in (raw_syn_hids if isinstance(raw_syn_hids, Sequence) and not isinstance(raw_syn_hids, (str, bytes)) else [])
                     if str(x).strip()
                 ]
+                if envelope.role == ScientificRole.RESEARCH_LEAD and eff_scoped_sg_id and syn_hids:
+                    cross_sg_syn = [
+                        shid
+                        for shid in syn_hids
+                        if (
+                            (h_chk := (db.get_goal_hypothesis(goal.goal_id, shid) if hasattr(db, "get_goal_hypothesis") else db.get_hypothesis(shid)))
+                            is not None
+                            and getattr(h_chk, "subgoal_id", None) != eff_scoped_sg_id
+                        )
+                    ]
+                    if cross_sg_syn:
+                        summary["rejected"].append(
+                            {
+                                "action": kind.value,
+                                "hypothesis_ids": cross_sg_syn,
+                                "reason": f"CROSS_SUBGOAL_MUTATION_FORBIDDEN: TrackLead scoped to {eff_scoped_sg_id!r}",
+                            }
+                        )
+                        continue
                 needs_s3_review = bool(
                     params.get("require_synthesis_review", False)
                     or len(syn_hids) >= 2
@@ -2991,19 +3537,42 @@ def apply_scientific_actions(
 
             elif kind == ActionKind.REQUEST_DIRECTOR_ADJUDICATION:
                 if hasattr(db, "enqueue_decision_request"):
+                    cur_goal_adj = (
+                        db.get_goal(goal.goal_id) if hasattr(db, "get_goal") else None
+                    ) or goal
+                    safe_adj_params = {
+                        k: v
+                        for k, v in params.items()
+                        if k
+                        not in {
+                            "plan_epoch",
+                            "attempt",
+                            "goal_version",
+                            "human_epoch",
+                            "lease_id",
+                            "submit_nonce",
+                            "usage_key",
+                            "pinned_route",
+                            "hq_job_id",
+                            "submit_job_name",
+                            "submit_owner_pid",
+                            "submit_proc_start_time",
+                            "submitting_started_ts",
+                        }
+                    }
                     dreq = db.enqueue_decision_request(
                         goal.goal_id,
                         tier="L2",
                         role=ScientificRole.RESEARCH_DIRECTOR,
                         trigger_kind="DIRECTOR_ADJUDICATION",
-                        goal_version=int(goal.version),
-                        human_epoch=int(goal.human_epoch),
+                        goal_version=int(cur_goal_adj.version),
+                        human_epoch=int(cur_goal_adj.human_epoch),
                         payload={
+                            **safe_adj_params,
                             "rationale": act.rationale,
                             "target_hypothesis_id": target_hid,
                             "uncertainty_id": act.uncertainty_id,
-                            "plan_epoch": int(getattr(goal, "plan_epoch", 0) or 0),
-                            **params,
+                            "plan_epoch": int(getattr(cur_goal_adj, "plan_epoch", 0) or 0),
                         },
                     )
                     summary["director_requests"].append(dreq["req_id"])
@@ -3115,7 +3684,7 @@ def apply_scientific_actions(
                 summary["completed_milestones"].append(milestone_key)
 
             elif kind == ActionKind.REQUEST_OWNER_DECISION:
-                esc_key = f"esc:{target_hid or uuid.uuid4().hex[:8]}"
+                esc_key = f"esc:{target_hid or act.target_subgoal_id or uuid.uuid4().hex[:8]}"
                 if hasattr(db, "upsert_knowledge_item"):
                     db.upsert_knowledge_item(
                         goal.goal_id,
@@ -3124,6 +3693,7 @@ def apply_scientific_actions(
                         {
                             "rationale": act.rationale,
                             "target_hypothesis_id": target_hid,
+                            "target_subgoal_id": act.target_subgoal_id,
                             "uncertainty_id": act.uncertainty_id,
                             **params,
                         },
@@ -3131,6 +3701,803 @@ def apply_scientific_actions(
                         goal_version=int(goal.version),
                     )
                 summary["owner_escalations"].append(esc_key)
+
+            elif kind == ActionKind.SPAWN_SUBGOAL:
+                nested_sg = params.get("subgoal") if isinstance(params.get("subgoal"), Mapping) else {}
+                sg_spec = {
+                    **dict(nested_sg),
+                    **{k: v for k, v in params.items() if k != "subgoal"},
+                }
+                sg_title = str(sg_spec.get("title") or "").strip()
+                sg_thesis = str(sg_spec.get("direction_thesis") or "").strip()
+                sg_contrib = str(sg_spec.get("direct_contribution") or "").strip()
+                sg_metric = str(sg_spec.get("local_metric") or "").strip()
+                spawn_errs: list[str] = []
+                if not sg_title:
+                    spawn_errs.append("missing non-empty title")
+                if not sg_thesis:
+                    spawn_errs.append("missing non-empty direction_thesis")
+                if _is_filler_contribution(sg_contrib):
+                    spawn_errs.append(
+                        "ANTI_FILLER_CONTRIBUTION_REJECTED: direct_contribution must be non-empty substantive work (not pure doc/hash bookkeeping)"
+                    )
+                if not sg_metric:
+                    spawn_errs.append("missing non-empty local_metric")
+
+                try:
+                    sg_kind = (
+                        sg_spec["kind"]
+                        if isinstance(sg_spec.get("kind"), SubGoalKind)
+                        else SubGoalKind(str(sg_spec.get("kind") or SubGoalKind.DIRECTION_TRACK.value))
+                    )
+                except Exception:
+                    spawn_errs.append(f"invalid SubGoalKind: {sg_spec.get('kind')!r}")
+                    sg_kind = SubGoalKind.DIRECTION_TRACK
+
+                raw_deps = sg_spec.get("depends_on_subgoals") or []
+                deps = (
+                    [str(d).strip() for d in raw_deps if str(d).strip()]
+                    if isinstance(raw_deps, Sequence) and not isinstance(raw_deps, (str, bytes))
+                    else []
+                )
+                dep_nodes: list[SubGoalNode] = []
+                for dep_id in deps:
+                    dep_sg = _get_goal_sg(dep_id)
+                    if dep_sg is None:
+                        spawn_errs.append(f"unknown dependency subgoal_id: {dep_id!r}")
+                    else:
+                        dep_nodes.append(dep_sg)
+
+                raw_specs = sg_spec.get("spec_paths") or []
+                spec_paths = (
+                    [str(p).strip() for p in raw_specs if str(p).strip()]
+                    if isinstance(raw_specs, Sequence) and not isinstance(raw_specs, (str, bytes))
+                    else ([str(raw_specs).strip()] if isinstance(raw_specs, str) and raw_specs.strip() else [])
+                )
+                if spec_paths:
+                    sp_gate = check_no_banned_access(
+                        paths=spec_paths,
+                        extra_bans=[*goal.banned_paths, *EXTRA_BANNED_FRAGMENTS],
+                        repo_path=goal.repo_path or None,
+                    )
+                    if not sp_gate.passed:
+                        spawn_errs.extend(f"spec_paths: {f}" for f in sp_gate.failures)
+
+                raw_wprefs = sg_spec.get("writable_prefixes")
+                if raw_wprefs is not None:
+                    wprefs = (
+                        [normalize_path_str(p, repo_path=goal.repo_path) for p in raw_wprefs if str(p).strip()]
+                        if isinstance(raw_wprefs, Sequence) and not isinstance(raw_wprefs, (str, bytes))
+                        else []
+                    )
+                    wprefs = [p for p in wprefs if p]
+                    if wprefs:
+                        wp_chk = validate_writable_paths(
+                            changed_paths=(),
+                            writable_paths=wprefs,
+                            goal_prefixes=goal.writable_prefixes,
+                        )
+                        if not wp_chk.passed:
+                            spawn_errs.extend(wp_chk.failures)
+                        ban_chk = check_no_banned_access(
+                            paths=wprefs,
+                            extra_bans=[*goal.banned_paths, *EXTRA_BANNED_FRAGMENTS],
+                            repo_path=goal.repo_path or None,
+                        )
+                        if not ban_chk.passed:
+                            spawn_errs.extend(ban_chk.failures)
+                else:
+                    wprefs = list(goal.writable_prefixes)
+
+                sg_id = str(
+                    act.target_subgoal_id
+                    or sg_spec.get("subgoal_id")
+                    or f"sg_{uuid.uuid4().hex[:8]}"
+                ).strip()
+                if _get_goal_sg(sg_id) is not None:
+                    spawn_errs.append(f"duplicate subgoal_id already exists: {sg_id!r}")
+
+                if spawn_errs:
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": sg_id, "reasons": spawn_errs, "reason": "; ".join(spawn_errs)}
+                    )
+                    continue
+
+                all_deps_sealed = bool(dep_nodes) and all(
+                    d.status == SubGoalStatus.SEALED.value for d in dep_nodes
+                )
+                init_status = (
+                    SubGoalStatus.ACTIVE.value
+                    if (not deps or all_deps_sealed)
+                    else SubGoalStatus.LOCKED_DEP.value
+                )
+                dep_sealed_shas = [str(d.sealed_sha) for d in dep_nodes if d.sealed_sha]
+                eff_base_sha = str(
+                    sg_spec.get("base_sha")
+                    or (dep_sealed_shas[-1] if all_deps_sealed and dep_sealed_shas else "")
+                    or goal.baseline_sha
+                )
+                raw_kc = sg_spec.get("kill_criteria") or []
+                sg_kc = (
+                    [str(k).strip() for k in raw_kc if str(k).strip()]
+                    if isinstance(raw_kc, Sequence) and not isinstance(raw_kc, (str, bytes))
+                    else []
+                )
+                sg_node = SubGoalNode(
+                    subgoal_id=sg_id,
+                    goal_id=goal.goal_id,
+                    title=sg_title,
+                    direction_thesis=sg_thesis,
+                    direct_contribution=sg_contrib,
+                    local_metric=sg_metric,
+                    kind=sg_kind,
+                    status=init_status,
+                    baseline_value=float(sg_spec.get("baseline_value", 0.0) or 0.0),
+                    target_value=(
+                        None if sg_spec.get("target_value") is None else float(sg_spec["target_value"])
+                    ),
+                    direction=str(sg_spec.get("direction") or "maximize").strip(),
+                    kill_criteria=sg_kc,
+                    depends_on_subgoals=deps,
+                    source_subgoal_ids=[],
+                    track_branch=str(sg_spec.get("track_branch") or f"track/{goal.project}/{sg_id}"),
+                    base_sha=eff_base_sha,
+                    sealed_sha=None,
+                    compute_target=str(sg_spec.get("compute_target") or "cpu_only").strip(),
+                    spec_paths=spec_paths,
+                    writable_prefixes=wprefs,
+                    priority_weight=float(
+                        sg_spec["priority_weight"] if sg_spec.get("priority_weight") is not None else 1.0
+                    ),
+                    max_tokens_budget=int(sg_spec.get("max_tokens_budget", 0) or 0),
+                    max_auto_generations=int(
+                        sg_spec["max_auto_generations"]
+                        if sg_spec.get("max_auto_generations") is not None
+                        else 1
+                    ),
+                    wave_gated=bool(sg_spec.get("wave_gated", True)),
+                    params=dict(sg_spec.get("params") or {}) if isinstance(sg_spec.get("params"), Mapping) else {},
+                )
+                sg_node = db.save_subgoal(sg_node)
+                summary["spawned_subgoal_ids"].append(sg_node.subgoal_id)
+
+                raw_slices = sg_spec.get("initial_slices")
+                if raw_slices is None:
+                    raw_slices = sg_spec.get("proposals")
+                if isinstance(raw_slices, Sequence) and not isinstance(raw_slices, (str, bytes)):
+                    prepared_slices: list[dict[str, Any]] = []
+                    for sl in raw_slices:
+                        if not isinstance(sl, Mapping):
+                            continue
+                        sd = dict(sl)
+                        if "writable_paths" not in sd and sg_node.writable_prefixes:
+                            sd["writable_paths"] = list(sg_node.writable_prefixes)
+                        if "kill_criteria" not in sd and sg_node.kill_criteria:
+                            sd["kill_criteria"] = list(sg_node.kill_criteria)
+                        prepared_slices.append(sd)
+                    if prepared_slices:
+                        sl_batch = import_proposals_json(
+                            goal,
+                            prepared_slices,
+                            db=db,
+                            persist=True,
+                            source=source,
+                            subgoal_id=sg_node.subgoal_id,
+                            subgoal=sg_node,
+                        )
+                        for h_acc in sl_batch.accepted:
+                            summary["accepted_hypothesis_ids"].append(h_acc.hypothesis_id)
+                        summary["rejected"].extend(sl_batch.rejected)
+
+            elif kind == ActionKind.RETUNE_SUBGOAL:
+                target_sg_id = str(
+                    act.target_subgoal_id
+                    or params.get("subgoal_id")
+                    or params.get("target_subgoal_id")
+                    or ""
+                ).strip()
+                target_sg = _get_goal_sg(target_sg_id)
+                if target_sg is None:
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": target_sg_id, "reason": "unknown target_subgoal_id"}
+                    )
+                    continue
+                if target_sg.status == SubGoalStatus.KILLED.value:
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": target_sg_id, "reason": "cannot retune KILLED subgoal"}
+                    )
+                    continue
+
+                now_rt = time.time()
+                fields_patch: dict[str, Any] = {}
+                retune_err = ""
+                for s_field in ("local_metric", "direction_thesis", "direction", "compute_target", "title", "direct_contribution"):
+                    if s_field in params and params[s_field] is not None:
+                        sval = str(params[s_field]).strip()
+                        if not sval:
+                            retune_err = f"empty {s_field} in RETUNE_SUBGOAL"
+                            break
+                        if s_field == "direct_contribution" and _is_filler_contribution(sval):
+                            retune_err = "ANTI_FILLER_CONTRIBUTION_REJECTED in RETUNE_SUBGOAL"
+                            break
+                        fields_patch[s_field] = sval
+                if retune_err:
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": target_sg_id, "reason": retune_err}
+                    )
+                    continue
+
+                if "target_value" in params:
+                    fields_patch["target_value"] = None if params["target_value"] is None else float(params["target_value"])
+                if "baseline_value" in params and params["baseline_value"] is not None:
+                    fields_patch["baseline_value"] = float(params["baseline_value"])
+                if "priority_weight" in params and params["priority_weight"] is not None:
+                    fields_patch["priority_weight"] = float(params["priority_weight"])
+                if "max_tokens_budget" in params and params["max_tokens_budget"] is not None:
+                    fields_patch["max_tokens_budget"] = int(params["max_tokens_budget"])
+                if "max_auto_generations" in params and params["max_auto_generations"] is not None:
+                    fields_patch["max_auto_generations"] = int(params["max_auto_generations"])
+                if "wave_gated" in params and params["wave_gated"] is not None:
+                    fields_patch["wave_gated"] = bool(params["wave_gated"])
+                if "kill_criteria" in params and isinstance(params["kill_criteria"], Sequence) and not isinstance(params["kill_criteria"], (str, bytes)):
+                    fields_patch["kill_criteria"] = [str(k).strip() for k in params["kill_criteria"] if str(k).strip()]
+                if "spec_paths" in params and isinstance(params["spec_paths"], Sequence) and not isinstance(params["spec_paths"], (str, bytes)):
+                    cand_sp = [str(p).strip() for p in params["spec_paths"] if str(p).strip()]
+                    if cand_sp:
+                        sp_chk = check_no_banned_access(
+                            paths=cand_sp,
+                            extra_bans=[*goal.banned_paths, *EXTRA_BANNED_FRAGMENTS],
+                            repo_path=goal.repo_path or None,
+                        )
+                        if not sp_chk.passed:
+                            summary["rejected"].append(
+                                {"action": kind.value, "subgoal_id": target_sg_id, "reason": "; ".join(sp_chk.failures)}
+                            )
+                            continue
+                    fields_patch["spec_paths"] = cand_sp
+
+                if fields_patch:
+                    target_sg = db.update_subgoal_fields(target_sg.subgoal_id, fields_patch, now=now_rt)
+
+                req_status = str(params.get("status") or "").strip().upper()
+                keep_status = bool(params.get("keep_status")) or req_status == SubGoalStatus.AWAITING_APEX.value
+                want_reset = bool(params.get("reset_status")) or req_status == SubGoalStatus.ACTIVE.value
+                if target_sg.status == SubGoalStatus.AWAITING_APEX.value and not keep_status:
+                    target_sg = db.transition_subgoal_status(
+                        target_sg.subgoal_id,
+                        SubGoalStatus.AWAITING_APEX.value,
+                        SubGoalStatus.ACTIVE.value,
+                        now=now_rt,
+                    )
+                elif want_reset and target_sg.status in (SubGoalStatus.AWAITING_APEX.value, SubGoalStatus.PAUSED.value):
+                    target_sg = db.transition_subgoal_status(
+                        target_sg.subgoal_id,
+                        target_sg.status,
+                        SubGoalStatus.ACTIVE.value,
+                        now=now_rt,
+                    )
+
+                sg_hyps_rt = (
+                    db.list_hypotheses(goal_id=goal.goal_id, subgoal_id=target_sg.subgoal_id)
+                    if hasattr(db, "list_hypotheses")
+                    else []
+                )
+                rt_hyp_param_patch: dict[str, Any] = {}
+                if target_sg.local_metric:
+                    rt_hyp_param_patch["subgoal_local_metric"] = target_sg.local_metric
+                    rt_hyp_param_patch["subgoal_baseline_value"] = float(target_sg.baseline_value)
+                    rt_hyp_param_patch["subgoal_direction"] = target_sg.direction
+                    rt_hyp_param_patch["subgoal_kill_criteria"] = list(target_sg.kill_criteria)
+                if target_sg.spec_paths:
+                    rt_hyp_param_patch["spec_paths"] = list(target_sg.spec_paths)
+                if rt_hyp_param_patch and hasattr(db, "update_hypothesis_params"):
+                    for h_rt in sg_hyps_rt:
+                        if h_rt.status not in ("COMPLETED", "REFUTED", "PRUNED", "CANCELLED", "GRAVEYARD"):
+                            db.update_hypothesis_params(h_rt.hypothesis_id, rt_hyp_param_patch, now=now_rt)
+
+                next_plan_epoch = int(getattr(goal, "plan_epoch", 0) or 0) + 1
+                goal.plan_epoch = next_plan_epoch
+                if hasattr(db, "save_goal"):
+                    db.save_goal(goal)
+                cancel_rt_hids = (
+                    {h_rt.hypothesis_id for h_rt in sg_hyps_rt}
+                    if bool(params.get("cancel_active"))
+                    else set()
+                )
+                _sync_active_task_epochs(
+                    next_plan_epoch,
+                    cancel_hids=cancel_rt_hids,
+                    cancel_reason=f"retune_subgoal:{target_sg.subgoal_id}:pe{next_plan_epoch}",
+                    now_ts=now_rt,
+                )
+                summary["retuned_subgoal_ids"].append(target_sg.subgoal_id)
+
+            elif kind == ActionKind.MERGE_SUBGOALS:
+                raw_sources = params.get("source_subgoal_ids") or params.get("subgoal_ids") or []
+                source_ids = (
+                    list(dict.fromkeys(str(s).strip() for s in raw_sources if str(s).strip()))
+                    if isinstance(raw_sources, Sequence) and not isinstance(raw_sources, (str, bytes))
+                    else []
+                )
+                if len(source_ids) < 2:
+                    summary["rejected"].append(
+                        {"action": kind.value, "reason": "MERGE_SUBGOALS requires >= 2 source_subgoal_ids"}
+                    )
+                    continue
+                src_nodes: list[SubGoalNode] = []
+                missing_src = False
+                for sid in source_ids:
+                    s_node = _get_goal_sg(sid)
+                    if s_node is None:
+                        summary["rejected"].append(
+                            {"action": kind.value, "subgoal_id": sid, "reason": f"unknown source_subgoal_id: {sid!r}"}
+                        )
+                        missing_src = True
+                        break
+                    src_nodes.append(s_node)
+                if missing_src:
+                    continue
+
+                merge_source_shas: list[str] = []
+                src_wpaths: list[str] = []
+                for s_node in src_nodes:
+                    chosen_sha = str(s_node.sealed_sha or "").strip()
+                    src_hyps = (
+                        db.list_hypotheses(goal_id=goal.goal_id, subgoal_id=s_node.subgoal_id)
+                        if hasattr(db, "list_hypotheses")
+                        else []
+                    )
+                    for sh in src_hyps:
+                        for wp in sh.writable_paths:
+                            if wp not in src_wpaths:
+                                src_wpaths.append(wp)
+                    if not chosen_sha:
+                        for sh in sorted(
+                            src_hyps,
+                            key=lambda h: (
+                                0 if h.scientific_verdict == ScientificVerdict.CONFIRMED else 1,
+                                0 if h.status in ("COMPLETED", "PROMOTED_F2", "PROMOTED_F3") else 1,
+                            ),
+                        ):
+                            if sh.head_sha and str(sh.head_sha).strip():
+                                chosen_sha = str(sh.head_sha).strip()
+                                break
+                    if chosen_sha and chosen_sha not in merge_source_shas:
+                        merge_source_shas.append(chosen_sha)
+
+                if not merge_source_shas:
+                    summary["rejected"].append(
+                        {
+                            "action": kind.value,
+                            "source_subgoal_ids": source_ids,
+                            "reason": "MERGE_SUBGOALS requires at least one source SubGoal with sealed_sha or head_sha",
+                        }
+                    )
+                    continue
+
+                primary_sha = str(params.get("base_sha") or merge_source_shas[0])
+                merge_sg_id = str(
+                    act.target_subgoal_id
+                    or params.get("subgoal_id")
+                    or f"sg_merge_{uuid.uuid4().hex[:8]}"
+                ).strip()
+                if _get_goal_sg(merge_sg_id) is not None:
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": merge_sg_id, "reason": f"duplicate merge subgoal_id: {merge_sg_id!r}"}
+                    )
+                    continue
+
+                merge_specs = list(
+                    dict.fromkeys(
+                        [
+                            *(str(p).strip() for p in (params.get("spec_paths") or []) if str(p).strip()),
+                            *(p for s_node in src_nodes for p in s_node.spec_paths),
+                        ]
+                    )
+                )
+                merge_wprefs = list(
+                    dict.fromkeys(
+                        [
+                            *(str(p).strip() for p in (params.get("writable_prefixes") or []) if str(p).strip()),
+                            *(p for s_node in src_nodes for p in s_node.writable_prefixes),
+                        ]
+                    )
+                ) or list(goal.writable_prefixes)
+                merge_kc = [
+                    str(k).strip()
+                    for k in (params.get("kill_criteria") or goal.kill_criteria or ["tests_passed == 0"])
+                    if str(k).strip()
+                ]
+                merge_sg = SubGoalNode(
+                    subgoal_id=merge_sg_id,
+                    goal_id=goal.goal_id,
+                    title=str(params.get("title") or f"Integration merge: {' + '.join(s.title for s in src_nodes[:3])}"),
+                    direction_thesis=str(
+                        params.get("direction_thesis")
+                        or act.rationale
+                        or f"Integrate verified tracks {', '.join(source_ids)} in an isolated worktree"
+                    ),
+                    direct_contribution=str(
+                        params.get("direct_contribution")
+                        or f"Merge and verify combined implementation from {', '.join(source_ids)}"
+                    ),
+                    local_metric=str(params.get("local_metric") or goal.primary_metric),
+                    kind=SubGoalKind.INTEGRATION_MERGE,
+                    status=SubGoalStatus.ACTIVE.value,
+                    baseline_value=float(
+                        params["baseline_value"]
+                        if params.get("baseline_value") is not None
+                        else goal.baseline_value
+                    ),
+                    target_value=(
+                        None if params.get("target_value") is None else float(params["target_value"])
+                    ),
+                    direction=str(params.get("direction") or goal.direction or "maximize"),
+                    kill_criteria=merge_kc,
+                    depends_on_subgoals=[],
+                    source_subgoal_ids=source_ids,
+                    track_branch=str(params.get("track_branch") or f"track/{goal.project}/{merge_sg_id}"),
+                    base_sha=primary_sha,
+                    sealed_sha=None,
+                    compute_target=str(params.get("compute_target") or "cpu_only"),
+                    spec_paths=merge_specs,
+                    writable_prefixes=merge_wprefs,
+                    priority_weight=float(
+                        params["priority_weight"] if params.get("priority_weight") is not None else 1.0
+                    ),
+                    max_tokens_budget=int(params.get("max_tokens_budget", 0) or 0),
+                    max_auto_generations=int(
+                        params["max_auto_generations"] if params.get("max_auto_generations") is not None else 1
+                    ),
+                    wave_gated=bool(params.get("wave_gated", True)),
+                )
+                merge_wpaths = [
+                    normalize_path_str(p, repo_path=goal.repo_path)
+                    for p in (params.get("writable_paths") or src_wpaths or merge_wprefs or ["src/"])
+                    if normalize_path_str(p, repo_path=goal.repo_path)
+                ]
+                if not merge_wpaths:
+                    merge_wpaths = [normalize_path_str(p, repo_path=goal.repo_path) for p in (goal.writable_prefixes or ["src/"])]
+                wp_merge_gate = validate_writable_paths(
+                    changed_paths=(),
+                    writable_paths=merge_wpaths,
+                    goal_prefixes=goal.writable_prefixes,
+                )
+                ban_merge_gate = check_no_banned_access(
+                    paths=merge_wpaths,
+                    extra_bans=[*goal.banned_paths, *EXTRA_BANNED_FRAGMENTS],
+                    repo_path=goal.repo_path or None,
+                )
+                if not wp_merge_gate.passed or not ban_merge_gate.passed:
+                    errs = [*wp_merge_gate.failures, *ban_merge_gate.failures]
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": merge_sg_id, "reasons": errs, "reason": "; ".join(errs)}
+                    )
+                    continue
+                merge_sg = db.save_subgoal(merge_sg)
+                merge_hyp_id = f"hyp_merge_{uuid.uuid4().hex[:8]}"
+                merge_hyp_params = {
+                    **(dict(params.get("hypothesis_params") or {}) if isinstance(params.get("hypothesis_params"), Mapping) else {}),
+                    "merge_source_shas": list(merge_source_shas),
+                    "merge_subgoal_ids": list(source_ids),
+                    "merge_source_branches": [s.track_branch for s in src_nodes if s.track_branch],
+                    "requires_llm_code": True,
+                    "subgoal_id": merge_sg.subgoal_id,
+                    "subgoal_local_metric": merge_sg.local_metric,
+                    "subgoal_baseline_value": float(merge_sg.baseline_value),
+                    "subgoal_direction": merge_sg.direction,
+                    "subgoal_kill_criteria": list(merge_sg.kill_criteria),
+                    "spec_paths": list(merge_sg.spec_paths),
+                    "wave_gated": bool(merge_sg.wave_gated),
+                }
+                merge_mech = str(params.get("mechanism") or f"integration_merge:{'+'.join(source_ids)}")
+                merge_acc_cmd = str(params.get("acceptance_cmd") or "pytest -q")
+                merge_scr_cmd = str(params.get("screen_cmd") or merge_acc_cmd)
+                merge_fp = compute_fingerprint(
+                    kind=HypothesisKind.COMPETING_ROUTE,
+                    mechanism=merge_mech,
+                    params=merge_hyp_params,
+                    writable_paths=merge_wpaths,
+                    project=goal.project,
+                )
+                merge_hyp = HypothesisNode(
+                    hypothesis_id=merge_hyp_id,
+                    goal_id=goal.goal_id,
+                    parent_id=None,
+                    kind=HypothesisKind.COMPETING_ROUTE,
+                    title=str(params.get("hypothesis_title") or f"Integrate {', '.join(source_ids)}"),
+                    statement=str(
+                        params.get("statement")
+                        or f"Merge source commits {merge_source_shas} in an isolated worktree without mutating source branches."
+                    ),
+                    mechanism=merge_mech,
+                    fidelity=FidelityRung.F1_FAST_SCREEN,
+                    priority_evoi=float(params.get("priority_evoi", 1.0)),
+                    writable_paths=merge_wpaths,
+                    params=merge_hyp_params,
+                    kill_criteria=list(merge_sg.kill_criteria),
+                    acceptance_cmd=merge_acc_cmd,
+                    screen_cmd=merge_scr_cmd,
+                    confirm_cmd=params.get("confirm_cmd"),
+                    branch_name=f"arr/{goal.project}/{merge_hyp_id}",
+                    base_sha=primary_sha,
+                    status="PENDING",
+                    fingerprint=merge_fp,
+                    subgoal_id=merge_sg.subgoal_id,
+                )
+                merge_hyp, _created_mh = db.register_hypothesis(merge_hyp)
+                summary["accepted_hypothesis_ids"].append(merge_hyp.hypothesis_id)
+                if workflow_runtime is not None and hasattr(workflow_runtime, "create_workflow_for_hypothesis"):
+                    _wf_m, m_tasks = workflow_runtime.create_workflow_for_hypothesis(
+                        goal,
+                        merge_hyp,
+                        primitive="direct_hq",
+                        config_override={"require_design_review": False},
+                    )
+                    summary["emitted_task_ids"].extend(t.task_id for t in m_tasks)
+                elif hasattr(db, "enqueue_task"):
+                    m_task = db.enqueue_task(
+                        StageTask(
+                            task_id=f"tsk-{merge_hyp.hypothesis_id}-code-a1-{uuid.uuid4().hex[:6]}",
+                            idempotency_key=f"{goal.goal_id}:{merge_hyp.hypothesis_id}:CODE:a1",
+                            goal_id=goal.goal_id,
+                            hypothesis_id=merge_hyp.hypothesis_id,
+                            stage=StageKind.CODE,
+                            deps=[],
+                            resources=ResourceSpec(cpus=2, ram_mb=2048, llm_pool="gemini", wall_timeout_s=900),
+                            goal_version=int(goal.version),
+                            human_epoch=int(goal.human_epoch),
+                            plan_epoch=int(getattr(goal, "plan_epoch", 0) or 0),
+                            step_key="integration_merge_code",
+                        )
+                    )
+                    summary["emitted_task_ids"].append(m_task.task_id)
+                summary["merged_subgoal_ids"].append(merge_sg.subgoal_id)
+
+            elif kind == ActionKind.KILL_AND_REALLOCATE:
+                target_sg_id = str(
+                    act.target_subgoal_id
+                    or params.get("subgoal_id")
+                    or params.get("target_subgoal_id")
+                    or ""
+                ).strip()
+                target_sg = _get_goal_sg(target_sg_id)
+                if target_sg is None:
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": target_sg_id, "reason": "unknown target_subgoal_id"}
+                    )
+                    continue
+                if target_sg.status == SubGoalStatus.KILLED.value:
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": target_sg_id, "reason": "target_subgoal already KILLED"}
+                    )
+                    continue
+
+                now_kill = time.time()
+                freed_weight = max(0.0, float(getattr(target_sg, "priority_weight", 0.0) or 0.0))
+                freed_budget = max(0, int(getattr(target_sg, "max_tokens_budget", 0) or 0))
+                db.transition_subgoal_status(
+                    target_sg.subgoal_id,
+                    target_sg.status,
+                    SubGoalStatus.KILLED.value,
+                    now=now_kill,
+                )
+                db.update_subgoal_fields(
+                    target_sg.subgoal_id,
+                    {"priority_weight": 0.0, "max_tokens_budget": 0},
+                    now=now_kill,
+                )
+
+                sg_hyps_kill = (
+                    db.list_hypotheses(goal_id=goal.goal_id, subgoal_id=target_sg.subgoal_id)
+                    if hasattr(db, "list_hypotheses")
+                    else []
+                )
+                kill_hids = {h.hypothesis_id for h in sg_hyps_kill}
+                if kill_hids:
+                    _invalidate_synthesis_workflows_for_hids(
+                        db,
+                        goal,
+                        kill_hids,
+                        reason=f"subgoal_killed:{target_sg.subgoal_id}",
+                        next_plan_epoch=int(getattr(goal, "plan_epoch", 0) or 0),
+                    )
+                    if hasattr(db, "list_workflows"):
+                        for wf_obj in db.list_workflows(goal_id=goal.goal_id):
+                            if wf_obj.hypothesis_id in kill_hids and wf_obj.status in ("READY", "RUNNING", "WAITING"):
+                                db.update_workflow_state(
+                                    wf_obj.workflow_id,
+                                    status="CANCELLED",
+                                    state_patch={"cancel_reason": f"subgoal_killed:{target_sg.subgoal_id}"},
+                                    now=now_kill,
+                                )
+                    if hasattr(db, "list_tasks"):
+                        for t_obj in db.list_tasks(goal_id=goal.goal_id):
+                            if t_obj.hypothesis_id in kill_hids and t_obj.status in ("READY", "DISPATCHED", "RUNNING"):
+                                try:
+                                    db.transition_task_status(
+                                        t_obj.task_id,
+                                        ("READY", "DISPATCHED", "RUNNING"),
+                                        "CANCELLED",
+                                        finished_ts=now_kill,
+                                        now=now_kill,
+                                    )
+                                    if t_obj.hq_job_id is not None and hasattr(db, "record_pending_hq_cancellation"):
+                                        db.record_pending_hq_cancellation(
+                                            hq_job_id=int(t_obj.hq_job_id),
+                                            entity_kind="task",
+                                            entity_id=t_obj.task_id,
+                                            attempt=int(t_obj.attempt),
+                                            goal_id=goal.goal_id,
+                                            hypothesis_id=t_obj.hypothesis_id,
+                                            workflow_id=t_obj.workflow_id or "",
+                                            epoch=int(goal.human_epoch),
+                                            plan_epoch=int(getattr(goal, "plan_epoch", 0) or 0),
+                                            reason=f"subgoal_killed:{target_sg.subgoal_id}",
+                                            state="CANCEL_PENDING",
+                                            now=now_kill,
+                                        )
+                                except Exception:
+                                    pass
+                    for h_k in sg_hyps_kill:
+                        if h_k.status not in ("COMPLETED", "REFUTED", "VALID_NEGATIVE", "PRUNED", "CANCELLED", "GRAVEYARD"):
+                            prev_ks = h_k.status
+                            h_k.status = "CANCELLED"
+                            h_k.scientific_verdict = ScientificVerdict.NOT_APPLICABLE
+                            _db_register_or_update_hypothesis(db, h_k, prev_status=prev_ks)
+
+                raw_realloc = params.get("reallocate_to")
+                recipients: list[SubGoalNode] = []
+                if raw_realloc:
+                    realloc_ids = (
+                        [str(raw_realloc).strip()]
+                        if isinstance(raw_realloc, str)
+                        else (
+                            list(dict.fromkeys(str(x).strip() for x in raw_realloc if str(x).strip()))
+                            if isinstance(raw_realloc, Sequence)
+                            else []
+                        )
+                    )
+                    for rid_sg in realloc_ids:
+                        if rid_sg == target_sg.subgoal_id:
+                            continue
+                        r_node = _get_goal_sg(rid_sg)
+                        if r_node is not None and r_node.status != SubGoalStatus.KILLED.value:
+                            recipients.append(r_node)
+                else:
+                    recipients = [
+                        sib
+                        for sib in db.list_subgoals(goal_id=goal.goal_id, status=SubGoalStatus.ACTIVE.value)
+                        if sib.subgoal_id != target_sg.subgoal_id
+                    ]
+
+                if recipients and (freed_weight > 0.0 or freed_budget > 0):
+                    n_rec = len(recipients)
+                    weight_share = freed_weight / n_rec
+                    base_b_share = freed_budget // n_rec
+                    rem_b = freed_budget % n_rec
+                    for idx_r, r_sg in enumerate(recipients):
+                        add_b = base_b_share + (1 if idx_r < rem_b else 0)
+                        db.update_subgoal_fields(
+                            r_sg.subgoal_id,
+                            {
+                                "priority_weight": round(float(r_sg.priority_weight) + weight_share, 6),
+                                "max_tokens_budget": int(r_sg.max_tokens_budget) + add_b,
+                            },
+                            now=now_kill,
+                        )
+                summary["killed_subgoal_ids"].append(target_sg.subgoal_id)
+
+            elif kind == ActionKind.SYNC_SUBGOAL_BASE:
+                target_sg_id = str(
+                    act.target_subgoal_id
+                    or params.get("subgoal_id")
+                    or params.get("target_subgoal_id")
+                    or ""
+                ).strip()
+                target_sg = _get_goal_sg(target_sg_id)
+                if target_sg is None:
+                    summary["rejected"].append(
+                        {"action": kind.value, "subgoal_id": target_sg_id, "reason": "unknown target_subgoal_id"}
+                    )
+                    continue
+
+                now_sync = time.time()
+                upstream_id = str(params.get("upstream_subgoal_id") or "").strip()
+                explicit_sha = str(params.get("sha") or params.get("base_sha") or "").strip()
+                new_base_sha = explicit_sha
+                if not new_base_sha and upstream_id:
+                    up_sg = _get_goal_sg(upstream_id)
+                    if up_sg is None:
+                        summary["rejected"].append(
+                            {"action": kind.value, "subgoal_id": target_sg_id, "reason": f"unknown upstream_subgoal_id: {upstream_id!r}"}
+                        )
+                        continue
+                    new_base_sha = str(up_sg.sealed_sha or "").strip()
+                elif not new_base_sha and target_sg.depends_on_subgoals:
+                    for dep_id in target_sg.depends_on_subgoals:
+                        dep_sg = _get_goal_sg(dep_id)
+                        if dep_sg is not None and dep_sg.status == SubGoalStatus.SEALED.value and dep_sg.sealed_sha:
+                            new_base_sha = str(dep_sg.sealed_sha).strip()
+
+                if not new_base_sha:
+                    summary["rejected"].append(
+                        {
+                            "action": kind.value,
+                            "subgoal_id": target_sg_id,
+                            "reason": "SYNC_SUBGOAL_BASE requires upstream sealed_sha or explicit sha",
+                        }
+                    )
+                    continue
+
+                target_sg = db.update_subgoal_fields(
+                    target_sg.subgoal_id,
+                    {"base_sha": new_base_sha},
+                    now=now_sync,
+                )
+                if target_sg.status == SubGoalStatus.LOCKED_DEP.value:
+                    dep_nodes_sync = [_get_goal_sg(dep_id) for dep_id in target_sg.depends_on_subgoals]
+                    if all(d is not None and d.status == SubGoalStatus.SEALED.value for d in dep_nodes_sync):
+                        db.transition_subgoal_status(
+                            target_sg.subgoal_id,
+                            SubGoalStatus.LOCKED_DEP.value,
+                            SubGoalStatus.ACTIVE.value,
+                            now=now_sync,
+                        )
+                summary["synced_subgoal_ids"].append(target_sg.subgoal_id)
+
+        if (
+            summary["revised_hypothesis_ids"]
+            and workflow_runtime is not None
+            and hasattr(workflow_runtime, "create_workflow_for_hypothesis")
+            and hasattr(db, "list_workflows")
+            and hasattr(db, "list_tasks")
+        ):
+            cur_goal_rev = (db.get_goal(goal.goal_id) if hasattr(db, "get_goal") else None) or goal
+            all_wfs = db.list_workflows(goal_id=goal.goal_id)
+            all_tasks = db.list_tasks(goal_id=goal.goal_id)
+            stalled_statuses = {
+                "NEEDS_REPAIR",
+                "BLOCKED_ENV",
+                "BLOCKED_INFRA",
+                "BLOCKED_TIMEOUT",
+                "BLOCKED_REPAIR_BUDGET",
+                "NEEDS_PLAN_REVISION",
+            }
+            seen_rev: set[str] = set()
+            for rev_hid in summary["revised_hypothesis_ids"]:
+                if rev_hid in seen_rev or rev_hid in no_dispatch_revised:
+                    continue
+                seen_rev.add(rev_hid)
+                rev_hyp = (
+                    db.get_goal_hypothesis(goal.goal_id, rev_hid)
+                    if hasattr(db, "get_goal_hypothesis")
+                    else (db.get_hypothesis(rev_hid) if hasattr(db, "get_hypothesis") else None)
+                )
+                if rev_hyp is None or rev_hyp.status in ("COMPLETED", "PRUNED", "REFUTED", "GRAVEYARD"):
+                    continue
+                has_active_task = any(
+                    t.hypothesis_id == rev_hid and t.status in ("READY", "DISPATCHED", "RUNNING")
+                    for t in all_tasks
+                )
+                if has_active_task:
+                    continue
+                has_prior_wf = any(w.hypothesis_id == rev_hid for w in all_wfs)
+                if not (has_prior_wf or rev_hyp.status in stalled_statuses):
+                    continue
+                rev_bstate = dict(rev_hyp.budget_state or {})
+                rev_bstate["code_repairs_used"] = 0
+                if hasattr(db, "transition_hypothesis_status"):
+                    rev_hyp = db.transition_hypothesis_status(
+                        rev_hyp.hypothesis_id,
+                        rev_hyp.status,
+                        "PENDING",
+                        budget_state_patch=rev_bstate,
+                    )
+                _wf_new, rev_new_tasks = workflow_runtime.create_workflow_for_hypothesis(
+                    cur_goal_rev, rev_hyp
+                )
+                summary["emitted_task_ids"].extend(t.task_id for t in rev_new_tasks)
 
         return summary
 
@@ -3167,6 +4534,8 @@ class ExploreEngine:
         ready_queue_count: int = 0,
         dispatchable_slots: int | None = None,
         persist: bool = True,
+        subgoal_id: str | None = None,
+        subgoal: SubGoalNode | None = None,
     ) -> ProposalBatchResult:
         """Propose, validate, deduplicate, and EVOI-rank hypotheses for a goal."""
         return propose_hypotheses(
@@ -3180,6 +4549,8 @@ class ExploreEngine:
             ai_model=self.ai_model,
             subprocess_runner=self.subprocess_runner,
             persist=persist,
+            subgoal_id=subgoal_id,
+            subgoal=subgoal,
         )
 
     def reconcile(

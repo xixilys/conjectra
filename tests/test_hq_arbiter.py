@@ -399,16 +399,21 @@ def test_arbiter_retry_bounds_circuit_breaker_and_interop(tmp_path: Path) -> Non
         assert parsed is not None
         _, start_t = parsed
         assert verify_process_identity(proc.pid, start_t).alive is True
+        assert verify_process_identity(proc.pid, parsed).alive is True
+        assert verify_process_identity(proc.pid, list(parsed)).alive is True
         recycled = verify_process_identity(proc.pid, start_t + 999)
         assert recycled.alive is False and recycled.recycled is True
+        recycled_seq = verify_process_identity(proc.pid, ["R", start_t + 999])
+        assert recycled_seq.alive is False and recycled_seq.recycled is True
         plan = arbiter.recover_stale_leases(
             [
                 {"lease_id": "live", "pid": proc.pid, "proc_start_time": start_t, "expires_ts": time.time() + 60},
+                {"lease_id": "live_seq", "pid": proc.pid, "proc_start_time": list(parsed), "expires_ts": time.time() + 60},
                 {"lease_id": "recycled", "pid": proc.pid, "proc_start_time": start_t + 1, "expires_ts": time.time() + 60},
                 {"lease_id": "dead", "pid": 99999999, "proc_start_time": 123, "expires_ts": time.time() + 60},
             ]
         )
-        assert [x["lease_id"] for x in plan["still_alive"]] == ["live"]
+        assert [x["lease_id"] for x in plan["still_alive"]] == ["live", "live_seq"]
         assert {x["lease_id"] for x in plan["stale_to_requeue"]} == {"recycled", "dead"}
     finally:
         proc.terminate()

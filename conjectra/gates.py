@@ -1545,15 +1545,49 @@ def validate_experiment_plan_gate(
     if int(plan.screen_timeout_s) < 30 or int(plan.confirm_timeout_s) < 30:
         res.failures.append("screen_timeout_s and confirm_timeout_s must be >= 30s")
 
-    allowed_hw = {"cpu_only", "local_gpu", "cloud_gpu"}
+    allowed_hw = {"cpu_only", "local_gpu", "cloud_gpu", "slurm_cluster"}
     if plan.required_hardware not in allowed_hw:
         res.failures.append(
             f"Invalid required_hardware={plan.required_hardware!r}; expected one of {sorted(allowed_hw)}"
         )
     if int(plan.min_vram_mb) > 0 and plan.required_hardware == "cpu_only":
         res.failures.append(
-            "min_vram_mb > 0 requires required_hardware in {'local_gpu', 'cloud_gpu'}"
+            "min_vram_mb > 0 requires required_hardware in {'local_gpu', 'cloud_gpu', 'slurm_cluster'}"
         )
+    if plan.required_hardware == "slurm_cluster":
+        hyp_params = dict(hyp.params or {}) if hyp is not None else {}
+        bad_fs_prefixes = ("/scratch", "/data", "/work", "/public", "/lustre", "/gpfs", "/project", "/mnt/", "/Volumes/")
+        inspect_blobs = [
+            plan.venv_python,
+            *[f"{k}={v}" for k, v in (plan.env_vars or {}).items()],
+            *(
+                [hyp.acceptance_cmd, hyp.screen_cmd, hyp.confirm_cmd or ""]
+                if hyp is not None
+                else []
+            ),
+        ]
+        for blob in inspect_blobs:
+            if any(pfx in str(blob) for pfx in bad_fs_prefixes):
+                res.failures.append(
+                    "slurm_cluster restricts storage strictly to $HOME; external filesystems (/scratch, /data, /work, etc.) are prohibited"
+                )
+                break
+        if hyp is not None:
+            for c_label, c_val in (("screen_cmd", hyp.screen_cmd), ("confirm_cmd", hyp.confirm_cmd or "")):
+                c_s = str(c_val or "").strip()
+                if c_s and not re.search(r"\b(sbatch|srun)\b", c_s):
+                    res.failures.append(
+                        f"slurm_cluster prohibits heavy work on the login node ({c_label} must submit via Slurm sbatch/srun)"
+                    )
+        if not bool(hyp_params.get("slurm_queue_checked")):
+            res.failures.append(
+                "slurm_cluster requires live Slurm queue inspection (sinfo/squeue) matched to task demand before submission (params.slurm_queue_checked=True)"
+            )
+        is_long_slurm = int(plan.confirm_timeout_s) > 600 or int(plan.screen_timeout_s) > 600 or bool(hyp_params.get("long_running"))
+        if is_long_slurm and not bool(hyp_params.get("slurm_owner_approved")):
+            res.failures.append(
+                "slurm_cluster initial long-running jobs require prior owner notification/approval (params.slurm_owner_approved=True)"
+            )
 
     eff_bans = list(extra_bans)
     if goal is not None:

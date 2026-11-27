@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 import importlib
 from pathlib import Path
@@ -30,7 +31,7 @@ from conjectra.planning import (
     is_reversible_f1_exploratory,
     validate_r1_fast_lane_contract,
 )
-from conjectra.state_db import StateDB
+from conjectra.state_db import StateDB, StateTransitionError
 from conjectra.types import (
     AuditVerdict,
     ConstraintStrength,
@@ -51,6 +52,8 @@ from conjectra.types import (
     ScientificVerdict,
     StageKind,
     StageTask,
+    SubGoalKind,
+    SubGoalNode,
     WorkflowNode,
 )
 from conjectra.workload_matrix import ensure_eval_table, extract_workload_features
@@ -123,6 +126,28 @@ def _try_build_default_router(
     except Exception:
         return None
     return None
+
+
+def _resolve_subgoal_for_hyp(db: Any, hyp: HypothesisNode) -> SubGoalNode | None:
+    """Resolve the SubGoalNode for `hyp` if `subgoal_id` is present and DB supports lookup."""
+    params = hyp.params if isinstance(hyp.params, Mapping) else {}
+    sg_id = getattr(hyp, "subgoal_id", None) or params.get("subgoal_id")
+    if not sg_id or db is None or not hasattr(db, "get_subgoal"):
+        return None
+    try:
+        return db.get_subgoal(str(sg_id))
+    except Exception:
+        return None
+
+
+def _is_foundation_build_hyp(hyp: HypothesisNode, subgoal: SubGoalNode | None) -> bool:
+    """Return True when a hypothesis belongs to a `FOUNDATION_BUILD` SubGoal."""
+    if subgoal is not None:
+        kind_val = subgoal.kind.value if hasattr(subgoal.kind, "value") else str(subgoal.kind)
+        if str(kind_val).strip().upper() == SubGoalKind.FOUNDATION_BUILD.value:
+            return True
+    params = hyp.params if isinstance(hyp.params, Mapping) else {}
+    return str(params.get("subgoal_kind") or "").strip().upper() == SubGoalKind.FOUNDATION_BUILD.value
 
 
 @dataclass
@@ -255,6 +280,21 @@ class WorkflowSelector:
             milestone_phases=max(1, milestone_phases),
         )
         w_class = feats.classify()
+        subgoal = _resolve_subgoal_for_hyp(db, hyp)
+        if _is_foundation_build_hyp(hyp, subgoal):
+            explicit_raw = (
+                params.get("workflow_primitive")
+                or params.get("collab_mode")
+                or params.get("routed_mode")
+            )
+            prev_prim = self._normalize_primitive(str(explicit_raw)) if explicit_raw else None
+            return WorkflowSelection(
+                primitive="direct_hq",
+                rationale="FOUNDATION_BUILD_DIRECT_HQ_COLLAPSE",
+                workload_class=w_class,
+                switched_from=prev_prim if prev_prim and prev_prim != "direct_hq" else None,
+            )
+
         ledger_stats = self._query_ledger_stats(db, w_class)
 
         receipts = list(prior_receipts or ())
@@ -422,10 +462,18 @@ class WorkflowRuntime:
             return True
         if any(
             bool(params.get(k))
-            for k in ("touches_holdout", "requires_paid_gpu", "paid_cloud_gpu", "irreversible", "require_design_review_strict")
+            for k in (
+                "touches_holdout",
+                "requires_paid_gpu",
+                "paid_cloud_gpu",
+                "unapproved_paid_gpu",
+                "unapproved_paid_cloud_hardware",
+                "irreversible",
+                "require_design_review_strict",
+            )
         ):
             return True
-        if str(params.get("required_hardware") or "").strip().lower() == "cloud_gpu":
+        if str(params.get("required_hardware") or "").strip().lower() in ("cloud_gpu", "paid_cloud_gpu", "slurm_cluster"):
             return True
         norm_tags = {str(t).strip().lower() for t in hyp.tags if str(t).strip()}
         for extra_tag in params.get("tags", []) if isinstance(params.get("tags"), list) else []:
@@ -443,8 +491,8 @@ class WorkflowRuntime:
         }
         return bool(norm_tags & hard_r1_tags)
 
-    @staticmethod
     def _requires_design_review(
+        self,
         goal: ResearchGoal,
         hyp: HypothesisNode,
         cfg: Mapping[str, Any],
@@ -453,8 +501,19 @@ class WorkflowRuntime:
         """Return True when mandatory risk/fidelity triggers or policy requires LLM pre-code R1 `DESIGN_REVIEW`."""
         params = dict(hyp.params or {})
         # Hard risk, fidelity (F2/F3), holdout, paid-GPU, and irreversible checks ALWAYS dominate overrides
-        if WorkflowRuntime._has_mandatory_design_review_trigger(goal, hyp):
+        if self._has_mandatory_design_review_trigger(goal, hyp):
             return True
+        subgoal = _resolve_subgoal_for_hyp(self.db, hyp)
+        if subgoal is not None:
+            compute_target = str(getattr(subgoal, "compute_target", "") or "").strip().lower()
+            if compute_target in ("cloud_gpu", "colab_gpu", "paid_cloud_gpu", "paid_gpu", "slurm_cluster") and not bool(
+                params.get("paid_gpu_approved") or params.get("cloud_gpu_approved") or params.get("slurm_owner_approved")
+            ):
+                return True
+            if bool(subgoal.wave_gated):
+                return False
+        elif params.get("wave_gated") is True:
+            return False
         if "require_design_review" in cfg:
             return bool(cfg["require_design_review"])
         if "require_design_review" in params:
@@ -688,8 +747,15 @@ class WorkflowRuntime:
 
         if stage == StageKind.CPU_GATE:
             exp_plan = self.db.get_latest_experiment_plan(hyp.hypothesis_id)
-            gate_cap = exp_plan.gate_timeout_s if exp_plan is not None else int(hyp.params.get("gate_timeout_s", 90))
-            gate_cap = min(max(30, gate_cap), 180)
+            if resources_override is not None and res.wall_timeout_s:
+                gate_wt = int(res.wall_timeout_s)
+            elif exp_plan is not None:
+                gate_wt = int(exp_plan.gate_timeout_s)
+            elif "gate_timeout_s" in hyp.params:
+                gate_wt = int(hyp.params["gate_timeout_s"])
+            else:
+                gate_wt = int(res.wall_timeout_s or 90)
+            gate_cap = min(max(30, gate_wt), 180) if resources_override is None else min(max(1, gate_wt), 180)
             res = ResourceSpec(
                 cpus=res.cpus,
                 ram_mb=res.ram_mb,
@@ -697,8 +763,42 @@ class WorkflowRuntime:
                 llm_pool=None,
                 eda_sim=res.eda_sim,
                 cloud_slot=0,
-                wall_timeout_s=min(int(res.wall_timeout_s or gate_cap), 180),
+                wall_timeout_s=gate_cap,
             )
+        elif stage == StageKind.EXP_SCREEN and resources_override is None:
+            exp_plan = self.db.get_latest_experiment_plan(hyp.hypothesis_id)
+            if exp_plan is not None or "screen_timeout_s" in hyp.params:
+                scr_wt = int(
+                    exp_plan.screen_timeout_s
+                    if exp_plan is not None
+                    else hyp.params.get("screen_timeout_s", res.wall_timeout_s or 300)
+                )
+                res = ResourceSpec(
+                    cpus=res.cpus,
+                    ram_mb=res.ram_mb,
+                    gpu=res.gpu,
+                    llm_pool=res.llm_pool,
+                    eda_sim=res.eda_sim,
+                    cloud_slot=res.cloud_slot,
+                    wall_timeout_s=max(30, scr_wt),
+                )
+        elif stage == StageKind.EXP_CONFIRM and resources_override is None:
+            exp_plan = self.db.get_latest_experiment_plan(hyp.hypothesis_id)
+            if exp_plan is not None or "confirm_timeout_s" in hyp.params:
+                cnf_wt = int(
+                    exp_plan.confirm_timeout_s
+                    if exp_plan is not None
+                    else hyp.params.get("confirm_timeout_s", res.wall_timeout_s or 1200)
+                )
+                res = ResourceSpec(
+                    cpus=res.cpus,
+                    ram_mb=res.ram_mb,
+                    gpu=res.gpu,
+                    llm_pool=res.llm_pool,
+                    eda_sim=res.eda_sim,
+                    cloud_slot=res.cloud_slot,
+                    wall_timeout_s=max(30, cnf_wt),
+                )
 
         is_deterministic_zero_llm = (
             stage == StageKind.CODE
@@ -1302,6 +1402,26 @@ class WorkflowRuntime:
                         return f"invalid_slice_edge:{s_name}->{dep_s}"
             return None
 
+        subgoal = _resolve_subgoal_for_hyp(self.db, hyp)
+        if _is_foundation_build_hyp(hyp, subgoal):
+            cfg["foundation_build"] = True
+            if subgoal is not None:
+                cfg.setdefault("subgoal_id", subgoal.subgoal_id)
+            if eff_prim != "direct_hq":
+                _collapse_to_direct(
+                    eff_prim,
+                    "FOUNDATION_BUILD_DIRECT_HQ",
+                    {"subgoal_id": getattr(subgoal, "subgoal_id", None) or params.get("subgoal_id")},
+                )
+                if not (config_override and "review_tier" in config_override):
+                    review_tier = classify_review_tier(
+                        goal,
+                        hyp,
+                        diff_lines=int(params.get("estimated_diff_lines", 0)),
+                        workflow_primitive="direct_hq",
+                    )
+                    cfg["review_tier"] = review_tier.value
+
         if eff_prim == "x-boost":
             adv_pool, adv_family = self._resolve_pool_spec(
                 str(cfg.get("adversary_spec") or params.get("adversary_spec") or "auto"),
@@ -1528,6 +1648,17 @@ class WorkflowRuntime:
             exp_plan = self.db.get_latest_experiment_plan(hyp.hypothesis_id)
             if exp_plan is None:
                 exp_plan = self.plan_manager.build_default_experiment_plan(goal, hyp)
+            if (
+                subgoal is not None
+                and subgoal.local_metric
+                and isinstance(exp_plan.control_baseline, Mapping)
+                and not str(exp_plan.control_baseline.get("primary_metric") or "").strip()
+            ):
+                exp_plan.control_baseline = {
+                    **dict(exp_plan.control_baseline),
+                    "primary_metric": subgoal.local_metric,
+                    "baseline_value": float(subgoal.baseline_value),
+                }
             det_gate = validate_r1_fast_lane_contract(
                 exp_plan,
                 goal,
@@ -2173,6 +2304,17 @@ class WorkflowRuntime:
                 HypothesisKind.ABLATION,
                 HypothesisKind.FALSIFICATION,
             ):
+                if (
+                    bool(fresh_wf.config.get("foundation_build"))
+                    and hyp.fidelity in (FidelityRung.F0_SANITY, FidelityRung.F1_FAST_SCREEN)
+                    and not bool((hyp.params or {}).get("require_confirm"))
+                ):
+                    self.db.update_workflow_state(
+                        fresh_wf.workflow_id,
+                        status="COMPLETED",
+                        state_patch={"step": "completed", "completed_steps": completed_steps},
+                    )
+                    return []
                 self.db.update_workflow_state(
                     fresh_wf.workflow_id,
                     state_patch={"step": confirm_key, "completed_steps": completed_steps},
@@ -3341,6 +3483,8 @@ class WorkflowRuntime:
 
         # Bubble child workflow completion/failure up to parent_workflow_id
         updated_self = self.db.get_workflow(fresh_wf.workflow_id) or fresh_wf
+        if updated_self.status in TERMINAL_WORKFLOW_STATUSES:
+            self.cancel_terminal_workflow_tasks(updated_self.goal_id, updated_self.workflow_id)
         if updated_self.parent_workflow_id and updated_self.status in ("COMPLETED", "FAILED"):
             parent_wf = self.db.get_workflow(updated_self.parent_workflow_id)
             if parent_wf is not None and parent_wf.status not in TERMINAL_WORKFLOW_STATUSES:
@@ -3356,6 +3500,25 @@ class WorkflowRuntime:
                 )
 
         return emitted
+
+    def cancel_terminal_workflow_tasks(
+        self,
+        goal_id: str,
+        workflow_id: str,
+        *,
+        now: float | None = None,
+    ) -> int:
+        """Cancel all remaining non-terminal READY/PENDING tasks belonging to a terminal workflow."""
+        ts = time.time() if now is None else float(now)
+        cancelled = 0
+        for rt in self.db.list_tasks(goal_id=goal_id):
+            if rt.workflow_id == workflow_id and rt.status in ("READY", "PENDING"):
+                with contextlib.suppress(StateTransitionError):
+                    self.db.transition_task_status(
+                        rt.task_id, rt.status, "CANCELLED", finished_ts=ts, now=ts
+                    )
+                    cancelled += 1
+        return cancelled
 
     def _respawn_swarm_tick(
         self,

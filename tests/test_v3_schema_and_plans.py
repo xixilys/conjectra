@@ -300,7 +300,7 @@ def test_v3_migration_idempotency_concurrency_and_legacy_role_derivation(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         versions = list(pool.map(_open_and_check, range(6)))
-    assert versions == [8, 8, 8, 8, 8, 8]
+    assert versions == [9, 9, 9, 9, 9, 9]
 
     with StateDB(arr_home) as db:
         req_l2 = db.get_decision_request("dreq_legacy_l2")
@@ -1020,7 +1020,7 @@ def test_v4_schema_migration_backfill_epoch_review_uniqueness_and_budget_reserva
     raw.close()
 
     with StateDB(arr_home) as db:
-        assert int(db._conn.execute("PRAGMA user_version").fetchone()[0]) == 8
+        assert int(db._conn.execute("PRAGMA user_version").fetchone()[0]) == 9
         usage = db.get_goal_token_usage("g_mig")
         # Both historical receipt (5000) AND historical decision (3500) are accounted!
         assert usage["in_tokens"] == 7000
@@ -1199,7 +1199,7 @@ def test_r2_primary_key_collisions_promotion_intents_cas_task_leases_and_budget_
     )
 
     with StateDB(tmp_path / "r2_arr") as db:
-        assert int(db._conn.execute("PRAGMA user_version").fetchone()[0]) == 8
+        assert int(db._conn.execute("PRAGMA user_version").fetchone()[0]) == 9
         db.save_goal(ga)
         db.save_goal(gb)
         for h in (ha1, ha2, hb1):
@@ -1465,8 +1465,8 @@ def test_r3_v6_migration_legacy_s3_revoked_leases_dual_key_exec_plan_and_attempt
     # and fails closed on the snapshot-less S3 workflow (`SYNTHESIS_SUPERSEDED`) + cancels its READY task!
     with StateDB(arr_home) as db:
         with db._lock:
-            uv8 = int(db._conn.execute("PRAGMA user_version").fetchone()[0])
-        assert uv8 == 8
+            uv9 = int(db._conn.execute("PRAGMA user_version").fetchone()[0])
+        assert uv9 == 9
         assert len(db.list_revoked_barrier_leases()) == 125
         assert db.is_barrier_lease_revoked("lease_hist_000") is True
         assert db.is_barrier_lease_revoked("lease_hist_124") is True
@@ -1739,7 +1739,7 @@ def test_stage5_v8_schema_migration_and_nonce_scoped_cancellation(tmp_path: path
 
     with StateDB(arr_home) as db:
         with db._lock:
-            assert int(db._conn.execute("PRAGMA user_version").fetchone()[0]) == 8
+            assert int(db._conn.execute("PRAGMA user_version").fetchone()[0]) == 9
             cols = {
                 str(r[1])
                 for r in db._conn.execute("PRAGMA table_info(pending_hq_cancellations)").fetchall()

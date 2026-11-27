@@ -2380,3 +2380,175 @@ def test_r6_typed_unknown_finding_fails_closed_and_default_router_passes_arbiter
         )
         out = eng.process_request(str(dreq["req_id"]), dry_run_llm=True)
         assert out["status"] == "RESOLVED"
+        prompt = eng._build_role_prompt(dreq, goal, [], [])
+        assert "as a JSON array of up to" not in prompt
+        assert '"actions"' in prompt
+        assert "Return STRICT JSON ONLY" in prompt
+
+
+def test_director_epoch_sanitization_revise_respawn_gate_timeouts_and_slurm_cloud(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Verify:
+    1) REQUEST_DIRECTOR_ADJUDICATION ignores LLM-supplied stale plan_epoch and stamps live DB plan_epoch.
+    2) REVISE_HYPOTHESIS updates commands and respawns a workflow on stalled/FAILED hypotheses (unless dispatch=False).
+    3) WorkflowRuntime propagates gate_timeout_s (up to 180s) and screen_timeout_s (>180s) instead of clamping to 90s/180s.
+    4) read_cloud_slot_state aggregates multi-account fresh cloud runtimes.
+    5) slurm_cluster enforces Slurm-only execution, $HOME-only storage, no R1 fast-lane, and owner confirmation on long jobs.
+    """
+    from conjectra.arbiter import read_cloud_slot_state
+    from conjectra.gates import validate_experiment_plan_gate
+    from conjectra.planning import is_reversible_f1_exploratory, validate_r1_fast_lane_contract
+    from conjectra.types import ExperimentPlan, WorkflowNode
+
+    # 4) Multi-account cloud slot aggregation
+    cdir = tmp_path / "cloud_multi"
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / "cloud_slot_state_1.json").write_text(
+        json.dumps({"runtime_id": "rt-g4-1", "status": "ready", "available_slots": 1, "active_jobs": 1}),
+        encoding="utf-8",
+    )
+    (cdir / "cloud_runtime_acct2_a100.json").write_text(
+        json.dumps({"runtime_id": "rt-a100-2", "accelerator": "A100", "status": "active", "available_slots": 3, "active_jobs": 0}),
+        encoding="utf-8",
+    )
+    # Duplicate runtime_id must be deduplicated
+    (cdir / "cloud_runtime_dup.json").write_text(
+        json.dumps({"runtime_id": "rt-a100-2", "status": "active", "available_slots": 3, "active_jobs": 0}),
+        encoding="utf-8",
+    )
+    cloud_agg = read_cloud_slot_state([cdir])
+    assert cloud_agg.stale is False
+    assert cloud_agg.available_slots == 4
+    assert cloud_agg.active_jobs == 1
+
+    with StateDB(tmp_path / "arr_fixes") as db:
+        goal = _goal("g_fixes")
+        db.save_goal(goal)
+        rt = WorkflowRuntime(db, router=_FakeModelRouter())
+
+        h_stalled = _hyp(goal, "hyp_stalled")
+        h_stalled.status = "NEEDS_REPAIR"
+        h_stalled.budget_state["code_repairs_used"] = 2
+        db.register_hypothesis(h_stalled)
+        db.save_workflow(
+            WorkflowNode(
+                workflow_id="wf_failed_old",
+                goal_id=goal.goal_id,
+                hypothesis_id=h_stalled.hypothesis_id,
+                primitive="direct_hq",
+                status="FAILED",
+            )
+        )
+
+        # 1) & 2) REVISE_HYPOTHESIS bumps plan_epoch ->0 to 1, updates acceptance_cmd + gate/screen timeouts,
+        # respawns fresh workflow, AND subsequent REQUEST_DIRECTOR_ADJUDICATION with bogus plan_epoch=99 gets plan_epoch=1!
+        env = LeadDecisionEnvelope(
+            role=ScientificRole.RESEARCH_LEAD,
+            goal_id=goal.goal_id,
+            actions=[
+                LeadAction(
+                    action=ActionKind.REVISE_HYPOTHESIS,
+                    target_hypothesis_id=h_stalled.hypothesis_id,
+                    parameters={
+                        "acceptance_cmd": "python3 -m pytest -q src/",
+                        "experiment_plan": {
+                            "falsifiable_claim": "Revised claim with extended CPU gate",
+                            "control_baseline": {"primary_metric": "spectral_gap", "baseline_value": 0.42},
+                            "gate_timeout_s": 180,
+                            "screen_timeout_s": 600,
+                        },
+                    },
+                ),
+                LeadAction(
+                    action=ActionKind.REQUEST_DIRECTOR_ADJUDICATION,
+                    target_hypothesis_id=h_stalled.hypothesis_id,
+                    rationale="Adjudicate secondary metric",
+                    parameters={"plan_epoch": 99, "attempt": 9},
+                ),
+            ],
+        )
+        res = apply_scientific_actions(db, goal, env, workflow_runtime=rt)
+        assert h_stalled.hypothesis_id in res["revised_hypothesis_ids"]
+        assert len(res["emitted_task_ids"]) >= 1
+        assert len(res["director_requests"]) == 1
+
+        dreq_dir = db.get_decision_request(res["director_requests"][0])
+        assert dreq_dir is not None
+        assert dreq_dir["payload"]["plan_epoch"] == 1
+        assert dreq_dir["payload"]["attempt"] == 1
+
+        updated_h = db.get_hypothesis(h_stalled.hypothesis_id)
+        assert updated_h is not None
+        assert updated_h.status == "PENDING"
+        assert updated_h.acceptance_cmd == "python3 -m pytest -q src/"
+
+        # 3) Verify CPU_GATE and EXP_SCREEN timeout propagation from ExperimentPlan
+        wf_last = db.list_workflows(goal_id=goal.goal_id)[-1]
+        t_gate = rt._make_task(
+            goal,
+            updated_h,
+            wf_last,
+            StageKind.CPU_GATE,
+            step_key="gate_chk",
+            deps=[],
+        )
+        t_scr = rt._make_task(
+            goal,
+            updated_h,
+            wf_last,
+            StageKind.EXP_SCREEN,
+            step_key="scr_chk",
+            deps=[],
+        )
+        assert t_gate.resources.wall_timeout_s == 180
+        assert t_scr.resources.wall_timeout_s == 600
+
+        # 5) slurm_cluster governance rules
+        h_slurm = _hyp(goal, "hyp_slurm", params={"required_hardware": "slurm_cluster"})
+        h_slurm.screen_cmd = "python3 train_heavy.py"
+        h_slurm.confirm_cmd = "sbatch --wrap='python3 /scratch/out.py'"
+        assert is_reversible_f1_exploratory(goal, h_slurm) is False
+
+        ep_bad = ExperimentPlan(
+            exp_plan_id="ep_slurm_bad",
+            goal_id=goal.goal_id,
+            hypothesis_id=h_slurm.hypothesis_id,
+            falsifiable_claim="Test slurm rules",
+            control_baseline={"primary_metric": "spectral_gap", "baseline_value": 0.42},
+            required_hardware="slurm_cluster",
+            confirm_timeout_s=1800,
+        )
+        assert not validate_r1_fast_lane_contract(ep_bad, goal, h_slurm).passed
+        g_bad = validate_experiment_plan_gate(ep_bad, goal, h_slurm)
+        assert not g_bad.passed
+        joined_fail = " | ".join(g_bad.failures)
+        assert "strictly to $HOME" in joined_fail
+        assert "login node" in joined_fail
+        assert "slurm_queue_checked" in joined_fail
+        assert "slurm_owner_approved" in joined_fail
+
+        h_slurm_ok = _hyp(
+            goal,
+            "hyp_slurm_ok",
+            params={
+                "required_hardware": "slurm_cluster",
+                "slurm_queue_checked": True,
+                "slurm_owner_approved": True,
+            },
+        )
+        h_slurm_ok.acceptance_cmd = "pytest -q tests/test_local.py"
+        h_slurm_ok.screen_cmd = "srun -c 4 python3 ~/proj/run_screen.py"
+        h_slurm_ok.confirm_cmd = "sbatch ~/proj/run_confirm.sbatch"
+        ep_ok = ExperimentPlan(
+            exp_plan_id="ep_slurm_ok",
+            goal_id=goal.goal_id,
+            hypothesis_id=h_slurm_ok.hypothesis_id,
+            falsifiable_claim="Valid Slurm home-only approved run",
+            control_baseline={"primary_metric": "spectral_gap", "baseline_value": 0.42},
+            required_hardware="slurm_cluster",
+            venv_python="~/venvs/ml/bin/python",
+            confirm_timeout_s=1800,
+        )
+        g_ok = validate_experiment_plan_gate(ep_ok, goal, h_slurm_ok)
+        assert g_ok.passed, g_ok.failures

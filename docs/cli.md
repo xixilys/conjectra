@@ -22,7 +22,8 @@ Commands print JSON unless noted.
 | [`route-workload`](#route-workload) | Classify task features and pick optimal mode from empirical ledger |
 | [`eval-matrix`](#eval-matrix) | Run 4-class fault-seeded empirical mode ablation benchmark |
 | [`overview`](#overview) | Sub-50ms multi-Goal overview from SQLite WAL |
-| [`inspect`](#inspect) | Sub-50ms Goal/Hypothesis/Workflow inspection |
+| [`inspect`](#inspect) | Sub-50ms Goal/SubGoal/Hypothesis/Workflow inspection |
+| [`subgoals`](#subgoals) | Sub-50ms SubGoal portfolio inspection from SQLite WAL |
 | [`token-audit`](#token-audit) | Audit real uncached vs cache tokens per Goal |
 | [`takeover`](#takeover) | Emit <3KB session-independent takeover brief |
 | [`intervene`](#intervene) | Atomic HITL intervention + instant reactor.sock wake |
@@ -427,10 +428,11 @@ options:
 
 ## inspect
 
-Sub-50ms Goal/Hypothesis/Workflow inspection
+Sub-50ms Goal/SubGoal/Hypothesis/Workflow inspection
 
 ```
 usage: conjectra inspect [-h] [--home DIR] [--goal-id GOAL_ID]
+                         [--subgoal-id SUBGOAL_ID]
                          [--hypothesis-id HYPOTHESIS_ID]
                          [--workflow-id WORKFLOW_ID] [--provider PROVIDER]
 
@@ -440,8 +442,27 @@ options:
                         State directory (default: $CONJECTRA_HOME or
                         ~/.conjectra)
   --goal-id GOAL_ID
+  --subgoal-id SUBGOAL_ID
   --hypothesis-id HYPOTHESIS_ID
   --workflow-id WORKFLOW_ID
+  --provider PROVIDER
+```
+
+## subgoals
+
+Sub-50ms SubGoal portfolio inspection from SQLite WAL
+
+```
+usage: conjectra subgoals [-h] [--home DIR] [--goal-id GOAL_ID]
+                          [--status STATUS] [--provider PROVIDER]
+
+options:
+  -h, --help            show this help message and exit
+  --home DIR, --arr-home DIR
+                        State directory (default: $CONJECTRA_HOME or
+                        ~/.conjectra)
+  --goal-id GOAL_ID
+  --status STATUS
   --provider PROVIDER
 ```
 
@@ -488,8 +509,8 @@ Atomic HITL intervention + instant reactor.sock wake
 
 ```
 usage: conjectra intervene [-h] [--home DIR] --scope
-                           {global,goal,branch,workflow,task} --action ACTION
-                           [--goal-id GOAL_ID] [--target-id TARGET_ID]
+                           {global,goal,subgoal,branch,workflow,task} --action
+                           ACTION [--goal-id GOAL_ID] [--target-id TARGET_ID]
                            [--payload PAYLOAD] [--actor ACTOR]
                            [--reason REASON] [--no-wake] [--provider PROVIDER]
 
@@ -498,7 +519,7 @@ options:
   --home DIR, --arr-home DIR
                         State directory (default: $CONJECTRA_HOME or
                         ~/.conjectra)
-  --scope {global,goal,branch,workflow,task}
+  --scope {global,goal,subgoal,branch,workflow,task}
   --action ACTION
   --goal-id GOAL_ID
   --target-id TARGET_ID

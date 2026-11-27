@@ -50,8 +50,13 @@ and burn tokens while doing nothing. Conjectra separates the two concerns:
   `prune_branch`, `focus`, `inject_hypothesis`, `override_verdict`, … are atomic SQLite
   transactions that bump a `human_epoch`; late results from before the intervention are fenced off
   instead of silently overwriting your decision.
-* **Session-independent hand-off** — `overview` / `inspect` answer in < 50 ms straight from the WAL;
-  `takeover` emits a < 3 KB brief that any human or agent can pick up from.
+* **SubGoal portfolios & two-tier decisions** — complex goals can decompose into independent
+  `SubGoalNode` tracks with local metrics, dependency locks (`LOCKED_DEP` auto-unlock with
+  `sealed_sha` propagation), weighted non-starvation scheduling, wave-gated fast lanes, track-isolated
+  `TrackLead` reviews (`< 3 KB` digests), and portfolio-level `ApexDirector` actions (`spawn`,
+  `retune`, `merge`, `kill`, `sync`).
+* **Session-independent hand-off** — `overview` / `subgoals` / `inspect` answer in < 50 ms straight
+  from the WAL; `takeover` emits a < 3 KB brief that any human or agent can pick up from.
 * **Real job execution** — production runs go through [HyperQueue](https://github.com/It4innovations/hyperqueue)
   with resource-aware placement (CPU, RAM, GPU, LLM pool slots); an `inline` mode runs everything
   in-process for development.
@@ -129,6 +134,7 @@ conjectra submit-goal --file my_goal.json          # see examples/quickstart/goa
 conjectra import-proposals --file proposals.json   # optional: your own hypotheses
 conjectra daemon --mode inline --propose-mode seeds --max-seconds 600
 conjectra overview
+conjectra subgoals --goal-id my-goal
 conjectra inspect --goal-id my-goal
 conjectra intervene --scope goal --goal-id my-goal --action pause --reason "need to look"
 conjectra takeover --goal-id my-goal --format markdown

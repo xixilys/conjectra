@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from conjectra.types import (
     ScientificVerdict,
     StageKind,
     StageTask,
+    SubGoalNode,
 )
 
 ENV_MISMATCH_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -187,6 +190,42 @@ def evaluate_kill_criteria(
 _MINIMIZE_DIRECTIONS = frozenset({"min", "minimize", "lower", "down", "reduce"})
 
 
+def _resolve_verdict_target(
+    goal: ResearchGoal,
+    hyp: HypothesisNode,
+    subgoal: SubGoalNode | None = None,
+) -> tuple[str, float, str, list[str], bool]:
+    """Resolve effective `(primary_metric, baseline, direction, kill_criteria, is_subgoal)`."""
+    hparams = dict(hyp.params or {}) if isinstance(getattr(hyp, "params", None), Mapping) else {}
+    if subgoal is not None and str(getattr(subgoal, "local_metric", "") or "").strip():
+        primary = str(subgoal.local_metric).strip()
+        baseline = float(getattr(subgoal, "baseline_value", 0.0) or 0.0)
+        direction = str(getattr(subgoal, "direction", "") or "maximize").strip().lower()
+        sg_kc = [str(k).strip() for k in (getattr(subgoal, "kill_criteria", None) or []) if str(k).strip()]
+        criteria = list(dict.fromkeys([*(hyp.kill_criteria or []), *sg_kc]))
+        return primary, baseline, direction, criteria, True
+
+    raw_local = str(hparams.get("subgoal_local_metric") or "").strip()
+    if raw_local:
+        raw_base = hparams.get("subgoal_baseline_value")
+        baseline = float(raw_base) if raw_base is not None else 0.0
+        direction = str(hparams.get("subgoal_direction") or "maximize").strip().lower()
+        raw_sg_kc = hparams.get("subgoal_kill_criteria")
+        sg_kc = (
+            [str(k).strip() for k in raw_sg_kc if str(k).strip()]
+            if isinstance(raw_sg_kc, (list, tuple))
+            else []
+        )
+        criteria = list(dict.fromkeys([*(hyp.kill_criteria or []), *sg_kc]))
+        return raw_local, baseline, direction, criteria, True
+
+    primary = (goal.primary_metric or "").strip()
+    baseline = float(goal.baseline_value)
+    direction = (goal.direction or "maximize").strip().lower()
+    criteria = list(dict.fromkeys([*(hyp.kill_criteria or []), *(goal.kill_criteria or [])]))
+    return primary, baseline, direction, criteria, False
+
+
 def evaluate_scientific_verdict(
     metrics: dict[str, Any],
     flat_vals: dict[str, float | int | bool],
@@ -197,6 +236,7 @@ def evaluate_scientific_verdict(
     *,
     missing_input_reason: str = "",
     combined_output: str = "",
+    subgoal: SubGoalNode | None = None,
 ) -> tuple[EvidenceValidity, ScientificVerdict, str]:
     """Evaluate strict scientific verdict and evidence validity from measured metrics."""
     if stage == StageKind.CPU_GATE:
@@ -216,7 +256,9 @@ def evaluate_scientific_verdict(
             if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val)):
                 merged_flat[k] = float(val)
 
-    primary = (goal.primary_metric or "").strip()
+    primary, baseline, direction, raw_criteria, using_subgoal = _resolve_verdict_target(
+        goal, hyp, subgoal=subgoal
+    )
     has_primary = bool(primary) and (primary in metrics or primary in merged_flat)
 
     env_mismatch = detect_env_config_mismatch(combined_output, "", "")
@@ -227,7 +269,6 @@ def evaluate_scientific_verdict(
             f"ENV_CONFIG_MISMATCH: {env_mismatch}",
         )
 
-    raw_criteria = list(dict.fromkeys([*(hyp.kill_criteria or []), *(goal.kill_criteria or [])]))
     if primary != "tests_passed" and not has_primary:
         criteria = [
             c
@@ -281,14 +322,15 @@ def evaluate_scientific_verdict(
         return (
             EvidenceValidity.MISSING_PRIMARY_METRIC,
             ScientificVerdict.UNKNOWN,
-            "Goal primary_metric is empty",
+            "SubGoal local_metric is empty" if using_subgoal else "Goal primary_metric is empty",
         )
 
     if not has_primary:
+        label = "SubGoal local metric" if using_subgoal else "Primary metric"
         return (
             EvidenceValidity.MISSING_PRIMARY_METRIC,
             ScientificVerdict.UNKNOWN,
-            f"Primary metric {primary!r} missing from {stage.value} metrics (tests_passed alone is engineering-only)",
+            f"{label} {primary!r} missing from {stage.value} metrics (tests_passed alone is engineering-only)",
         )
 
     raw_val = merged_flat[primary] if primary in merged_flat else metrics[primary]["value"]
@@ -307,8 +349,6 @@ def evaluate_scientific_verdict(
             f"Non-finite primary metric {primary!r}: {raw_val!r}",
         )
 
-    baseline = float(goal.baseline_value)
-    direction = (goal.direction or "maximize").strip().lower()
     if direction in _MINIMIZE_DIRECTIONS:
         if not (val < baseline):
             return (
@@ -353,6 +393,117 @@ class ProjectAdapter(ABC):
     ) -> str:
         """Return shell command to execute in worktree_path for the given stage."""
 
+    def _collect_bounded_spec_excerpts(
+        self,
+        hyp: HypothesisNode,
+        goal: ResearchGoal,
+        worktree_path: Path,
+        *,
+        max_bytes: int = 3600,
+    ) -> str:
+        """Read safe, repo-contained `spec_paths` bounded strictly under `<4KB`."""
+        raw_specs = (hyp.params or {}).get("spec_paths") if isinstance(hyp.params, Mapping) else None
+        if not raw_specs:
+            return ""
+        spec_list = (
+            [str(raw_specs).strip()]
+            if isinstance(raw_specs, str)
+            else [str(s).strip() for s in raw_specs if str(s).strip()]
+        )
+        if not spec_list:
+            return ""
+
+        from conjectra.explore import protected_repo_fragments
+        from conjectra.gates import check_no_banned_access
+
+        wt_root = worktree_path.expanduser().resolve() if worktree_path else None
+        repo_root = Path(goal.repo_path).expanduser().resolve() if goal.repo_path else None
+        roots = [r for r in (wt_root, repo_root) if r is not None and r.exists()]
+        if not roots:
+            return ""
+
+        extra_bans = [*list(goal.banned_paths or ()), *protected_repo_fragments()]
+        chunks: list[tuple[str, str]] = []
+        seen_resolved: set[Path] = set()
+        for sp in spec_list:
+            pre_gate = check_no_banned_access(
+                paths=[sp],
+                extra_bans=extra_bans,
+                repo_path=roots[0],
+            )
+            if not pre_gate.passed:
+                continue
+            cand_path: Path | None = None
+            matched_root: Path | None = None
+            sp_path = Path(sp).expanduser()
+            for root in roots:
+                try:
+                    resolved = (sp_path if sp_path.is_absolute() else (root / sp_path)).resolve()
+                except OSError:
+                    continue
+                if not resolved.is_relative_to(root):
+                    continue
+                if resolved.is_file():
+                    cand_path = resolved
+                    matched_root = root
+                    break
+            if cand_path is None or matched_root is None or cand_path in seen_resolved:
+                continue
+            post_gate = check_no_banned_access(
+                paths=[sp, str(cand_path)],
+                extra_bans=extra_bans,
+                repo_path=matched_root,
+            )
+            if not post_gate.passed:
+                continue
+            try:
+                text = cand_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if not text:
+                continue
+            seen_resolved.add(cand_path)
+            rel_label = str(cand_path.relative_to(matched_root))
+            chunks.append((rel_label, text))
+
+        if not chunks:
+            return ""
+
+        header = "Spec excerpts (<4KB):\n"
+        budget = max(256, min(3900, int(max_bytes))) - len(header.encode("utf-8"))
+        per_file_budget = max(128, budget // len(chunks))
+        parts: list[str] = []
+        used = 0
+        for label, body in chunks:
+            prefix = f"--- {label} ---\n"
+            prefix_b = len(prefix.encode("utf-8"))
+            if used + prefix_b >= budget:
+                break
+            rem = min(per_file_budget, budget - used) - prefix_b
+            if rem <= 32:
+                break
+            body_bytes = body.encode("utf-8")
+            if len(body_bytes) > rem:
+                marker = "\n...[truncated]"
+                take = max(1, rem - len(marker.encode("utf-8")))
+                clipped = body_bytes[:take].decode("utf-8", errors="ignore") + marker
+            else:
+                clipped = body
+            block = prefix + clipped + "\n"
+            block_b = len(block.encode("utf-8"))
+            if used + block_b > budget:
+                break
+            parts.append(block)
+            used += block_b
+
+        if not parts:
+            return ""
+        out = header + "".join(parts)
+        while len(out.encode("utf-8")) >= 4096 and len(parts) > 0:
+            parts.pop()
+            out = (header + "".join(parts)) if parts else ""
+        return out
+
     def build_code_prompt(
         self,
         hyp: HypothesisNode,
@@ -362,24 +513,35 @@ class ProjectAdapter(ABC):
         """Build a concise, bounded prompt for a one-shot AI CODE worker."""
         writable = ", ".join(hyp.writable_paths) if hyp.writable_paths else "(none)"
         banned = ", ".join(goal.banned_paths) if goal.banned_paths else "(none)"
-        kills = "; ".join(hyp.kill_criteria or goal.kill_criteria)
+        eff_primary, eff_base, eff_dir, eff_kills, is_sg = _resolve_verdict_target(goal, hyp)
+        kills = "; ".join(eff_kills)
+        metric_line = (
+            f"SubGoal local metric: {eff_primary} (direction={eff_dir}, baseline={eff_base}) | "
+            f"Master metric: {goal.primary_metric}\n"
+            if is_sg
+            else f"Primary metric: {goal.primary_metric} (direction={goal.direction}, baseline={goal.baseline_value})\n"
+        )
+        spec_section = self._collect_bounded_spec_excerpts(hyp, goal, worktree_path)
+        spec_block = f"\n{spec_section}" if spec_section else ""
+        acc_cmd = hyp.acceptance_cmd or "(none)"
         return (
             f"Goal: {goal.title}\n"
-            f"Primary metric: {goal.primary_metric} (direction={goal.direction}, baseline={goal.baseline_value})\n"
-            f"Hypothesis [{hyp.hypothesis_id}] ({hyp.kind.value}): {hyp.title}\n"
-            f"Statement: {hyp.statement}\n"
-            f"Mechanism: {hyp.mechanism}\n"
-            f"Params: {json.dumps(hyp.params, sort_keys=True)}\n"
-            f"Worktree: {worktree_path}\n"
-            f"ALLOWED writable paths ONLY: {writable}\n"
-            f"FORBIDDEN paths (NEVER read or modify): {banned}\n"
-            f"Kill criteria: {kills}\n"
-            f"Acceptance command to keep green: {hyp.acceptance_cmd}\n\n"
-            "Instructions:\n"
-            "1. Inspect only files relevant to the allowed writable paths.\n"
-            "2. Implement the minimal clean change on this branch; do NOT weaken or delete assertions.\n"
-            "3. Run the acceptance command locally before finishing.\n"
-            "4. Do NOT touch any forbidden paths or git branches outside HEAD.\n"
+            + metric_line
+            + f"Hypothesis [{hyp.hypothesis_id}] ({hyp.kind.value}): {hyp.title}\n"
+            + f"Statement: {hyp.statement}\n"
+            + f"Mechanism: {hyp.mechanism}\n"
+            + f"Params: {json.dumps(hyp.params, sort_keys=True)}\n"
+            + f"Worktree: {worktree_path}\n"
+            + f"ALLOWED writable paths ONLY: {writable}\n"
+            + f"FORBIDDEN paths (NEVER read or modify): {banned}\n"
+            + f"Kill criteria: {kills}\n"
+            + f"Acceptance command to keep green: {acc_cmd}\n"
+            + spec_block
+            + "\nInstructions:\n"
+            + "1. Inspect only files relevant to the allowed writable paths.\n"
+            + "2. Implement the minimal clean change on this branch; do NOT weaken or delete assertions.\n"
+            + f"3. Run acceptance_cmd (`{acc_cmd}`) inside worktree `{worktree_path}` and verify it passes before committing.\n"
+            + "4. Do NOT touch any forbidden paths or git branches outside HEAD.\n"
         )
 
     def default_resource_spec(
@@ -420,6 +582,8 @@ class ProjectAdapter(ABC):
         exit_code: int,
         hyp: HypothesisNode,
         goal: ResearchGoal,
+        *,
+        subgoal: SubGoalNode | None = None,
     ) -> tuple[dict[str, Any], ScientificVerdict, list[str], str]:
         """Parse stdout/artifacts into structured metrics, verdict, artifacts, and failure reason."""
 
@@ -433,6 +597,8 @@ class ProjectAdapter(ABC):
         exit_code: int,
         hyp: HypothesisNode,
         goal: ResearchGoal,
+        *,
+        subgoal: SubGoalNode | None = None,
     ) -> tuple[dict[str, Any], EvidenceValidity, ScientificVerdict, list[str], str]:
         """Parse metrics and return `(metrics, evidence_validity, scientific_verdict, artifacts, reason)`."""
         self.last_evidence_validity = (
@@ -440,19 +606,51 @@ class ProjectAdapter(ABC):
             if stage not in (StageKind.EXP_SCREEN, StageKind.EXP_CONFIRM)
             else EvidenceValidity.MISSING_INPUT
         )
-        metrics, sci_verdict, artifacts, reason = self.parse_metrics(
-            stage, stdout, stderr, worktree_path, artifact_dir, exit_code, hyp, goal
+        pm_sig = inspect.signature(self.parse_metrics).parameters
+        accepts_subgoal = "subgoal" in pm_sig or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in pm_sig.values()
         )
+        if accepts_subgoal:
+            metrics, sci_verdict, artifacts, reason = self.parse_metrics(
+                stage,
+                stdout,
+                stderr,
+                worktree_path,
+                artifact_dir,
+                exit_code,
+                hyp,
+                goal,
+                subgoal=subgoal,
+            )
+        else:
+            hyp_for_parse = hyp
+            if (
+                subgoal is not None
+                and str(getattr(subgoal, "local_metric", "") or "").strip()
+                and not str((hyp.params or {}).get("subgoal_local_metric") or "").strip()
+            ):
+                patched_params = {
+                    **dict(hyp.params or {}),
+                    "subgoal_local_metric": str(subgoal.local_metric).strip(),
+                    "subgoal_baseline_value": float(subgoal.baseline_value),
+                    "subgoal_direction": str(subgoal.direction or "maximize"),
+                    "subgoal_kill_criteria": list(subgoal.kill_criteria or ()),
+                }
+                hyp_for_parse = HypothesisNode.from_dict({**hyp.to_dict(), "params": patched_params})
+            metrics, sci_verdict, artifacts, reason = self.parse_metrics(
+                stage, stdout, stderr, worktree_path, artifact_dir, exit_code, hyp_for_parse, goal
+            )
         validity = getattr(self, "last_evidence_validity", EvidenceValidity.VALID_ENGINEERING_ONLY)
         if (
             stage in (StageKind.EXP_SCREEN, StageKind.EXP_CONFIRM)
             and sci_verdict == ScientificVerdict.CONFIRMED
         ):
-            primary = (goal.primary_metric or "").strip()
+            primary, _, _, _, using_subgoal = _resolve_verdict_target(goal, hyp, subgoal=subgoal)
             if not primary or primary not in metrics:
                 validity = EvidenceValidity.MISSING_PRIMARY_METRIC
                 sci_verdict = ScientificVerdict.UNKNOWN
-                reason = f"Primary metric {primary!r} missing from {stage.value} metrics"
+                label = "SubGoal local metric" if using_subgoal else "Primary metric"
+                reason = f"{label} {primary!r} missing from {stage.value} metrics"
                 self.last_evidence_validity = validity
 
         env_diag = detect_env_config_mismatch(stdout, stderr, reason)
@@ -547,6 +745,8 @@ class GenericAdapter(ProjectAdapter):
         exit_code: int,
         hyp: HypothesisNode,
         goal: ResearchGoal,
+        *,
+        subgoal: SubGoalNode | None = None,
     ) -> tuple[dict[str, Any], ScientificVerdict, list[str], str]:
         combined = f"{stdout}\n{stderr}"
         passed, total = parse_test_counts(combined, exit_code)
@@ -564,7 +764,14 @@ class GenericAdapter(ProjectAdapter):
                 flat_vals[name] = val
 
         validity, sci_verdict, reason = evaluate_scientific_verdict(
-            metrics, flat_vals, goal, hyp, stage, exit_code, combined_output=combined
+            metrics,
+            flat_vals,
+            goal,
+            hyp,
+            stage,
+            exit_code,
+            combined_output=combined,
+            subgoal=subgoal,
         )
         self.last_evidence_validity = validity
         return metrics, sci_verdict, [], reason

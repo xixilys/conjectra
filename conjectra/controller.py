@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 import errno
+import inspect
 import json
 import os
 import re
@@ -43,6 +44,7 @@ from conjectra.state_db import (
 )
 from conjectra.types import (
     AuditVerdict,
+    ConstraintStrength,
     EngineeringVerdict,
     EvidenceReceipt,
     EvidenceValidity,
@@ -57,6 +59,9 @@ from conjectra.types import (
     ScientificVerdict,
     StageKind,
     StageTask,
+    SubGoalKind,
+    SubGoalNode,
+    SubGoalStatus,
 )
 from conjectra.workflow_runtime import TERMINAL_WORKFLOW_STATUSES, WorkflowRuntime
 from conjectra.workload_matrix import record_workload_eval
@@ -341,37 +346,45 @@ class ResearchController:
             self.db.close()
 
     def _hydrate_from_events(self) -> None:
-        events = self.db.list_events(since_seq=0, limit=5000)
-        for ev in events:
-            etype = ev.get("event_type")
-            p = ev.get("payload") or {}
-            if etype == "CONTROLLER_TASK_HANDLED":
-                tid = ev.get("task_id") or p.get("task_id")
-                if tid:
-                    self._handled_tasks.add(str(tid))
-            elif etype == "OWNER_ESCALATION":
-                gid = str(ev.get("goal_id") or p.get("goal_id") or "")
-                gate = str(p.get("gate") or "")
-                reason = str(p.get("reason") or "")
-                self._recorded_escalations.add((gid, gate, reason))
-            elif etype == "BLIND_AUDIT_FAILED":
-                gid = str(ev.get("goal_id") or "")
-                if gid:
-                    self._failed_blind_audits[gid] = self._failed_blind_audits.get(gid, 0) + 1
-                    self._goal_ctx(gid).failed_blind_audits = self._failed_blind_audits[gid]
-            elif etype == "CONTROLLER_PROPOSE_ROUND":
-                gid = str(ev.get("goal_id") or "")
-                cnt = int(p.get("receipts_count", 0))
-                if gid:
-                    prev = self._last_propose_receipt_count.get(gid, -1)
-                    self._last_propose_receipt_count[gid] = max(prev, cnt)
-                    self._goal_ctx(gid).last_propose_receipt_count = max(
-                        self._goal_ctx(gid).last_propose_receipt_count, cnt
-                    )
-            elif etype == "CONTROLLER_DECISION_APPLIED":
-                rid = str(p.get("req_id") or "")
-                if rid:
-                    self._handled_decision_ids.add(rid)
+        since_seq = 0
+        while True:
+            events = self.db.list_events(since_seq=since_seq, limit=5000)
+            if not events:
+                break
+            for ev in events:
+                etype = ev.get("event_type")
+                p = ev.get("payload") or {}
+                if etype == "CONTROLLER_TASK_HANDLED":
+                    tid = ev.get("task_id") or p.get("task_id")
+                    if tid:
+                        self._handled_tasks.add(str(tid))
+                elif etype == "OWNER_ESCALATION":
+                    gid = str(ev.get("goal_id") or p.get("goal_id") or "")
+                    gate = str(p.get("gate") or "")
+                    reason = str(p.get("reason") or "")
+                    self._recorded_escalations.add((gid, gate, reason))
+                elif etype == "BLIND_AUDIT_FAILED":
+                    gid = str(ev.get("goal_id") or "")
+                    if gid:
+                        self._failed_blind_audits[gid] = self._failed_blind_audits.get(gid, 0) + 1
+                        self._goal_ctx(gid).failed_blind_audits = self._failed_blind_audits[gid]
+                elif etype == "CONTROLLER_PROPOSE_ROUND":
+                    gid = str(ev.get("goal_id") or "")
+                    cnt = int(p.get("receipts_count", 0))
+                    if gid:
+                        prev = self._last_propose_receipt_count.get(gid, -1)
+                        self._last_propose_receipt_count[gid] = max(prev, cnt)
+                        self._goal_ctx(gid).last_propose_receipt_count = max(
+                            self._goal_ctx(gid).last_propose_receipt_count, cnt
+                        )
+                elif etype == "CONTROLLER_DECISION_APPLIED":
+                    rid = str(p.get("req_id") or "")
+                    if rid:
+                        self._handled_decision_ids.add(rid)
+            last_seq = int(events[-1].get("seq") or 0)
+            if last_seq <= since_seq or len(events) < 5000:
+                break
+            since_seq = last_seq
 
     def _record_ledger_event(
         self,
@@ -1248,6 +1261,19 @@ class ResearchController:
         # Unified WorkflowNode-driven progression when task belongs to a WorkflowNode
         if task.workflow_id:
             wf = self.db.get_workflow(task.workflow_id)
+            if wf is None or wf.status in TERMINAL_WORKFLOW_STATUSES:
+                if wf is None:
+                    self._record_ledger_event(
+                        "ORPHAN_WORKFLOW_TASK_ISOLATED",
+                        goal_id=goal.goal_id,
+                        hypothesis_id=hyp.hypothesis_id,
+                        task_id=task.task_id,
+                        payload={"workflow_id": task.workflow_id, "status": task.status},
+                    )
+                else:
+                    self.workflow_runtime.cancel_terminal_workflow_tasks(goal.goal_id, wf.workflow_id)
+                self._mark_task_handled(task)
+                return
             if wf is not None and wf.status not in TERMINAL_WORKFLOW_STATUSES:
                 # Transient infra retry (`LEASE_LOST`, `ENV_ERROR` transient) before consuming workflow repairs
                 if (
@@ -1447,9 +1473,30 @@ class ResearchController:
                     if dec.cancelled_task_ids:
                         self._cancel_hq_for_tasks(dec.cancelled_task_ids)
                         summary["pruned"] += 1
-                    for child in dec.spawned_hypotheses:
-                        created = self._enqueue_initial_hypothesis_work(goal, child)
-                        summary["tasks_enqueued"] += len(created)
+                    cur_sg_id = self._hyp_subgoal_id(cur_h)
+                    cur_sg = (
+                        self.db.get_subgoal(cur_sg_id)
+                        if cur_sg_id and hasattr(self.db, "get_subgoal")
+                        else None
+                    )
+                    is_foundation_sg = bool(
+                        cur_sg is not None
+                        and str(getattr(cur_sg.kind, "value", cur_sg.kind)).upper()
+                        == SubGoalKind.FOUNDATION_BUILD.value
+                    )
+                    if is_foundation_sg:
+                        for child in dec.spawned_hypotheses:
+                            with contextlib.suppress(Exception):
+                                self.db.transition_hypothesis_status(
+                                    child.hypothesis_id,
+                                    child.status,
+                                    "PRUNED",
+                                    scientific_verdict=ScientificVerdict.NOT_APPLICABLE,
+                                )
+                    else:
+                        for child in dec.spawned_hypotheses:
+                            created = self._enqueue_initial_hypothesis_work(goal, child)
+                            summary["tasks_enqueued"] += len(created)
                     if (
                         updated_wf is not None
                         and updated_wf.status == "COMPLETED"
@@ -1792,6 +1839,549 @@ class ResearchController:
         if job_ids:
             self.hq.cancel_jobs(job_ids, reason="pruned_by_reconcile")
 
+    @staticmethod
+    def _hyp_subgoal_id(hyp: HypothesisNode | None) -> str | None:
+        if hyp is None:
+            return None
+        raw = getattr(hyp, "subgoal_id", None)
+        if not raw and isinstance(hyp.params, Mapping):
+            raw = hyp.params.get("subgoal_id")
+        s = str(raw or "").strip()
+        return s or None
+
+    @staticmethod
+    def _extract_metric_from_receipt(
+        receipt: EvidenceReceipt,
+        metric_name: str,
+    ) -> float | None:
+        if not metric_name or not isinstance(receipt.metrics, Mapping):
+            return None
+        raw = receipt.metrics.get(metric_name)
+        if isinstance(raw, Mapping) and "value" in raw:
+            raw = raw["value"]
+        if isinstance(raw, bool):
+            return None
+        try:
+            import math as _math
+
+            val = float(raw)
+            return val if _math.isfinite(val) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _enqueue_subgoal_decision(
+        self,
+        goal: ResearchGoal,
+        *,
+        role: ScientificRole,
+        tier: str,
+        trigger_kind: str,
+        subgoal_id: str | None = None,
+        urgency: str = "IMMEDIATE",
+        coalesce_window_s: float = 0.0,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body = dict(payload or {})
+        if subgoal_id:
+            body["subgoal_id"] = subgoal_id
+        kwargs: dict[str, Any] = {
+            "role": role,
+            "tier": tier,
+            "trigger_kind": trigger_kind,
+            "urgency": urgency,
+            "coalesce_window_s": coalesce_window_s,
+            "payload": body,
+        }
+        try:
+            params = inspect.signature(self.decision_engine.enqueue_decision).parameters
+            if "subgoal_id" in params and subgoal_id is not None:
+                kwargs["subgoal_id"] = subgoal_id
+        except Exception:
+            pass
+        return self.decision_engine.enqueue_decision(goal.goal_id, **kwargs)
+
+    @staticmethod
+    def _is_subgoal_winning_hypothesis(
+        goal: ResearchGoal,
+        sg: SubGoalNode,
+        hyp: HypothesisNode,
+        hyp_tasks: Sequence[StageTask],
+        hyp_receipts: Sequence[EvidenceReceipt],
+    ) -> bool:
+        bad_statuses = {
+            "REFUTED",
+            "PRUNED",
+            "VALID_NEGATIVE",
+            "GRAVEYARD",
+            "CANCELLED",
+            "HUMAN_INVALIDATED",
+            "NEEDS_REPAIR",
+            "NEEDS_PLAN_REVISION",
+            "RESULT_REJECTED",
+            "DESIGN_REJECTED",
+        }
+        if hyp.status in bad_statuses or str(hyp.status).startswith("BLOCKED_"):
+            return False
+
+        params = hyp.params if isinstance(hyp.params, Mapping) else {}
+        sg_params = sg.params if isinstance(sg.params, Mapping) else {}
+        audit_required = bool(
+            hyp.fidelity == FidelityRung.F3_MILESTONE_AUDIT
+            or params.get("requires_blind_audit")
+            or sg_params.get("requires_blind_audit")
+            or any(t.stage == StageKind.BLIND_AUDIT for t in hyp_tasks)
+        )
+        if audit_required:
+            audit_rcpts = [r for r in hyp_receipts if r.stage == StageKind.BLIND_AUDIT]
+            if not audit_rcpts:
+                return False
+            latest_audit = audit_rcpts[-1]
+            if (
+                latest_audit.process_status != ProcessStatus.EXIT_OK
+                or latest_audit.audit_verdict != AuditVerdict.PASS
+            ):
+                return False
+
+        confirmed_verdict = hyp.scientific_verdict == ScientificVerdict.CONFIRMED
+        met_target = False
+        if sg.target_value is not None and sg.local_metric:
+            emp_rcpts = [
+                r
+                for r in hyp_receipts
+                if r.stage in (StageKind.EXP_SCREEN, StageKind.EXP_CONFIRM)
+                and r.process_status == ProcessStatus.EXIT_OK
+                and r.engineering_verdict == EngineeringVerdict.PASS
+                and r.evidence_validity
+                not in (
+                    EvidenceValidity.STALE_GOAL_VERSION,
+                    EvidenceValidity.HUMAN_INVALIDATED,
+                    EvidenceValidity.SUPERSEDED_EPOCH,
+                )
+            ]
+            if emp_rcpts:
+                latest_emp = emp_rcpts[-1]
+                val = ResearchController._extract_metric_from_receipt(latest_emp, sg.local_metric)
+                if val is not None:
+                    direction = str(sg.direction or goal.direction or "maximize").strip().lower()
+                    if direction in ("min", "minimize", "lower", "down", "reduce"):
+                        met_target = val <= float(sg.target_value)
+                    else:
+                        met_target = val >= float(sg.target_value)
+        return confirmed_verdict or met_target
+
+    @staticmethod
+    def _is_subgoal_hypothesis_terminal_or_stalled(
+        sg: SubGoalNode,
+        hyp: HypothesisNode,
+        by_id: Mapping[str, HypothesisNode],
+        hyp_tasks: Sequence[StageTask],
+        hyp_receipts: Sequence[EvidenceReceipt],
+    ) -> bool:
+        terminal_statuses = {
+            "REFUTED",
+            "PRUNED",
+            "VALID_NEGATIVE",
+            "GRAVEYARD",
+            "CANCELLED",
+            "HUMAN_INVALIDATED",
+            "RESULT_REJECTED",
+            "DESIGN_REJECTED",
+        }
+        if hyp.status in terminal_statuses or str(hyp.status).startswith("BLOCKED_"):
+            return True
+        bstate = hyp.budget_state if isinstance(hyp.budget_state, Mapping) else {}
+        repairs_used = int(bstate.get("code_repairs_used", 0) or 0)
+        max_repairs = int(bstate.get("max_code_repairs", 2) or 2)
+        if repairs_used >= max_repairs:
+            return True
+        if hyp.status == "PENDING" and not hyp_tasks and not hyp_receipts:
+            return False
+
+        params = hyp.params if isinstance(hyp.params, Mapping) else {}
+        raw_gen = params.get("generation")
+        gen: int | None = None
+        if raw_gen is not None:
+            try:
+                g_val = int(raw_gen)
+                if g_val >= 1:
+                    gen = g_val
+            except (TypeError, ValueError):
+                gen = None
+        if gen is None:
+            gen = 1
+            seen = {hyp.hypothesis_id}
+            cur = hyp
+            while cur.parent_id and cur.parent_id not in seen:
+                seen.add(cur.parent_id)
+                parent = by_id.get(cur.parent_id)
+                if parent is None:
+                    break
+                gen += 1
+                cur = parent
+        max_auto_gens = max(1, int(getattr(sg, "max_auto_generations", 1) or 1))
+        if hyp.status == "NEEDS_REPAIR":
+            return repairs_used >= max_repairs
+        return gen >= max_auto_gens
+
+    def _unlock_ready_subgoals(
+        self,
+        goal: ResearchGoal,
+        subgoals: Sequence[SubGoalNode],
+        sg_by_id: dict[str, SubGoalNode],
+        hyps_by_sg: Mapping[str, list[HypothesisNode]],
+        tasks_by_hyp: dict[str, list[StageTask]],
+        wfs_by_hyp: Mapping[str, list[Any]],
+        summary: dict[str, Any],
+    ) -> list[SubGoalNode]:
+        unlocked_nodes: list[SubGoalNode] = []
+        for sg in subgoals:
+            cur_sg = sg_by_id.get(sg.subgoal_id, sg)
+            if str(cur_sg.status).upper() != SubGoalStatus.LOCKED_DEP.value:
+                continue
+            deps = [str(d).strip() for d in (cur_sg.depends_on_subgoals or []) if str(d).strip()]
+            dep_nodes = [sg_by_id.get(dep_id) for dep_id in deps]
+            if any(
+                dn is None or str(dn.status).upper() not in (SubGoalStatus.SEALED.value, SubGoalStatus.MERGED.value)
+                for dn in dep_nodes
+            ):
+                continue
+
+            # Propagate the latest upstream sealed_sha (ordered by updated_ts, tie-broken by list position)
+            latest_sha = ""
+            ranked_deps = sorted(
+                enumerate(dep_nodes),
+                key=lambda pair: (float(pair[1].updated_ts or 0.0) if pair[1] is not None else 0.0, pair[0]),
+            )
+            for _idx, dn in ranked_deps:
+                if dn is not None and (dn.sealed_sha or dn.base_sha):
+                    latest_sha = str(dn.sealed_sha or dn.base_sha)
+
+            with self.db._tx():
+                if latest_sha:
+                    self.db.update_subgoal_fields(cur_sg.subgoal_id, {"base_sha": latest_sha})
+                unlocked_sg = self.db.transition_subgoal_status(
+                    cur_sg.subgoal_id,
+                    SubGoalStatus.LOCKED_DEP.value,
+                    SubGoalStatus.ACTIVE.value,
+                    params_patch={
+                        "unlocked_from_deps": deps,
+                        "propagated_sealed_sha": latest_sha,
+                    },
+                )
+            sg_by_id[cur_sg.subgoal_id] = unlocked_sg
+            unlocked_nodes.append(unlocked_sg)
+            summary["subgoals_unlocked"] = summary.get("subgoals_unlocked", 0) + 1
+            self._record_ledger_event(
+                "SUBGOAL_UNLOCKED",
+                goal_id=goal.goal_id,
+                payload={
+                    "subgoal_id": unlocked_sg.subgoal_id,
+                    "base_sha": latest_sha,
+                    "depends_on_subgoals": deps,
+                },
+            )
+            for h in hyps_by_sg.get(unlocked_sg.subgoal_id, []):
+                if (
+                    h.status == "PENDING"
+                    and not tasks_by_hyp.get(h.hypothesis_id)
+                    and not wfs_by_hyp.get(h.hypothesis_id)
+                    and not (h.params or {}).get("no_auto_enqueue")
+                ):
+                    if latest_sha and not h.head_sha and h.base_sha != latest_sha:
+                        h.base_sha = latest_sha
+                        self.db.update_hypothesis_params(
+                            h.hypothesis_id, {"subgoal_base_sha": latest_sha}
+                        )
+                    created = self._enqueue_initial_hypothesis_work(goal, h)
+                    if created:
+                        tasks_by_hyp.setdefault(h.hypothesis_id, []).extend(created)
+                    summary["tasks_enqueued"] += len(created)
+        return unlocked_nodes
+
+    def _reconcile_subgoals_for_goal(
+        self,
+        goal: ResearchGoal,
+        summary: dict[str, Any],
+    ) -> None:
+        """Reconcile SubGoal dependencies, wave completion sealing, and TrackLead / Apex triggers."""
+        if not hasattr(self.db, "list_subgoals"):
+            return
+        subgoals = self.db.list_subgoals(goal_id=goal.goal_id)
+        if not subgoals or goal.autonomy_mode == "paused":
+            return
+
+        sg_by_id = {sg.subgoal_id: sg for sg in subgoals}
+        hyps = self.db.list_hypotheses(goal_id=goal.goal_id)
+        hyps_by_id = {h.hypothesis_id: h for h in hyps}
+        hyps_by_sg: dict[str, list[HypothesisNode]] = {}
+        for h in hyps:
+            sg_id = self._hyp_subgoal_id(h)
+            if sg_id:
+                hyps_by_sg.setdefault(sg_id, []).append(h)
+
+        tasks = self.db.list_tasks(goal_id=goal.goal_id)
+        tasks_by_hyp: dict[str, list[StageTask]] = {}
+        for t in tasks:
+            tasks_by_hyp.setdefault(t.hypothesis_id, []).append(t)
+
+        receipts = self.db.list_receipts(goal_id=goal.goal_id)
+        receipts_by_hyp: dict[str, list[EvidenceReceipt]] = {}
+        for r in receipts:
+            receipts_by_hyp.setdefault(r.hypothesis_id, []).append(r)
+
+        wfs = self.db.list_workflows(goal_id=goal.goal_id)
+        wfs_by_hyp: dict[str, list[Any]] = {}
+        for w in wfs:
+            wfs_by_hyp.setdefault(w.hypothesis_id, []).append(w)
+
+        pending_or_running_decs = [
+            d
+            for d in self.db.list_decision_requests(goal_id=goal.goal_id)
+            if d.get("status") in ("PENDING", "SUBMITTING", "RUNNING")
+        ]
+
+        def _has_pending_apex() -> bool:
+            return any(
+                str(d.get("role") or "") == ScientificRole.RESEARCH_DIRECTOR.value
+                or str(d.get("trigger_kind") or "") == "APEX_PORTFOLIO_REVIEW"
+                for d in pending_or_running_decs
+            )
+
+        def _maybe_enqueue_apex(trigger_sg: SubGoalNode, reason_tag: str, extra: Mapping[str, Any]) -> None:
+            if goal.autonomy_mode != "unattended":
+                return
+            if self.db.is_budget_exhausted(goal.goal_id):
+                return
+            if _has_pending_apex():
+                return
+            dreq = self._enqueue_subgoal_decision(
+                goal,
+                role=ScientificRole.RESEARCH_DIRECTOR,
+                tier="L2",
+                trigger_kind="APEX_PORTFOLIO_REVIEW",
+                subgoal_id=trigger_sg.subgoal_id,
+                urgency="IMMEDIATE",
+                coalesce_window_s=0.0,
+                payload={
+                    "subgoal_id": trigger_sg.subgoal_id,
+                    "reason": reason_tag,
+                    "director_adjudication": True,
+                    **dict(extra),
+                },
+            )
+            pending_or_running_decs.append(dreq)
+            summary["decisions_enqueued"] = summary.get("decisions_enqueued", 0) + 1
+
+        # 1. Unlock any LOCKED_DEP SubGoals whose dependencies are already SEALED
+        self._unlock_ready_subgoals(
+            goal, subgoals, sg_by_id, hyps_by_sg, tasks_by_hyp, wfs_by_hyp, summary
+        )
+
+        def _reconcile_one_active_subgoal(cur_sg: SubGoalNode) -> bool:
+            """Reconcile a single ACTIVE SubGoal's drained wave; return True if sealed."""
+            sg_hyps = hyps_by_sg.get(cur_sg.subgoal_id, [])
+            sg_tasks = [t for h in sg_hyps for t in tasks_by_hyp.get(h.hypothesis_id, [])]
+            active_or_ready = [
+                t for t in sg_tasks if t.status in ("READY", "DISPATCHED", "RUNNING")
+            ]
+            if active_or_ready:
+                return False
+
+            # Start any unstarted PENDING hypotheses inside this ACTIVE SubGoal before draining
+            started_new = False
+            for h in sg_hyps:
+                if (
+                    h.status == "PENDING"
+                    and not tasks_by_hyp.get(h.hypothesis_id)
+                    and not wfs_by_hyp.get(h.hypothesis_id)
+                    and not receipts_by_hyp.get(h.hypothesis_id)
+                    and not (h.params or {}).get("no_auto_enqueue")
+                ):
+                    created = self._enqueue_initial_hypothesis_work(goal, h)
+                    if created:
+                        started_new = True
+                        summary["tasks_enqueued"] += len(created)
+                        tasks_by_hyp.setdefault(h.hypothesis_id, []).extend(created)
+            if started_new:
+                return False
+
+            # Refresh hypothesis snapshots in case workflow creation transitioned status (e.g. NEEDS_PLAN_REVISION)
+            sg_hyps = [self.db.get_hypothesis(h.hypothesis_id) or h for h in sg_hyps]
+            for h in sg_hyps:
+                hyps_by_id[h.hypothesis_id] = h
+
+            # 2a. Winner found -> SEAL + trigger 1 transient APEX_PORTFOLIO_REVIEW
+            winners = [
+                h
+                for h in sg_hyps
+                if self._is_subgoal_winning_hypothesis(
+                    goal,
+                    cur_sg,
+                    h,
+                    tasks_by_hyp.get(h.hypothesis_id, []),
+                    receipts_by_hyp.get(h.hypothesis_id, []),
+                )
+            ]
+            if winners:
+                winning_hyp = sorted(winners, key=lambda x: (-float(x.priority_evoi), x.hypothesis_id))[0]
+                sealed_sha = str(
+                    winning_hyp.head_sha
+                    or winning_hyp.base_sha
+                    or cur_sg.base_sha
+                    or goal.baseline_sha
+                    or ""
+                )
+                sealed_sg = self.db.transition_subgoal_status(
+                    cur_sg.subgoal_id,
+                    SubGoalStatus.ACTIVE.value,
+                    SubGoalStatus.SEALED.value,
+                    sealed_sha=sealed_sha,
+                    params_patch={"winning_hypothesis_id": winning_hyp.hypothesis_id},
+                )
+                sg_by_id[cur_sg.subgoal_id] = sealed_sg
+                summary["subgoals_sealed"] = summary.get("subgoals_sealed", 0) + 1
+                self._record_ledger_event(
+                    "SUBGOAL_SEALED",
+                    goal_id=goal.goal_id,
+                    hypothesis_id=winning_hyp.hypothesis_id,
+                    payload={
+                        "subgoal_id": cur_sg.subgoal_id,
+                        "sealed_sha": sealed_sha,
+                    },
+                )
+                _maybe_enqueue_apex(
+                    sealed_sg,
+                    "subgoal_sealed",
+                    {
+                        "sealed_subgoal_id": cur_sg.subgoal_id,
+                        "sealed_sha": sealed_sha,
+                        "winning_hypothesis_id": winning_hyp.hypothesis_id,
+                    },
+                )
+                return True
+
+            # 2b. Empty ACTIVE SubGoal -> enqueue SubGoal-scoped TrackLead (`RESEARCH_LEAD`)
+            if len(sg_hyps) == 0:
+                if goal.autonomy_mode == "unattended" and not self.db.is_budget_exhausted(goal.goal_id):
+                    has_sg_dec = any(
+                        (d.get("subgoal_id") or (d.get("payload") or {}).get("subgoal_id")) == cur_sg.subgoal_id
+                        for d in pending_or_running_decs
+                    )
+                    if not has_sg_dec:
+                        dreq = self._enqueue_subgoal_decision(
+                            goal,
+                            role=ScientificRole.RESEARCH_LEAD,
+                            tier="L1",
+                            trigger_kind="INITIAL_PLANNING",
+                            subgoal_id=cur_sg.subgoal_id,
+                            urgency="IMMEDIATE",
+                            coalesce_window_s=0.0,
+                            payload={"subgoal_id": cur_sg.subgoal_id, "initial_planning": True},
+                        )
+                        pending_or_running_decs.append(dreq)
+                        summary["decisions_enqueued"] = summary.get("decisions_enqueued", 0) + 1
+                return False
+
+            # 2c. Terminal/stalled check -> AWAITING_APEX + trigger 1 transient APEX_PORTFOLIO_REVIEW
+            all_stalled = all(
+                self._is_subgoal_hypothesis_terminal_or_stalled(
+                    cur_sg,
+                    h,
+                    hyps_by_id,
+                    tasks_by_hyp.get(h.hypothesis_id, []),
+                    receipts_by_hyp.get(h.hypothesis_id, []),
+                )
+                for h in sg_hyps
+            )
+            if not all_stalled:
+                has_sg_dec = any(
+                    (d.get("subgoal_id") or (d.get("payload") or {}).get("subgoal_id")) == cur_sg.subgoal_id
+                    for d in pending_or_running_decs
+                )
+                if has_sg_dec:
+                    return False
+                latest_activity_ts = max(
+                    [
+                        *(float(t.finished_ts or t.enqueued_ts or 0.0) for t in sg_tasks),
+                        *(
+                            float(r.created_ts or 0.0)
+                            for h in sg_hyps
+                            for r in receipts_by_hyp.get(h.hypothesis_id, [])
+                        ),
+                    ],
+                    default=0.0,
+                )
+                resolved_sg_decs = [
+                    d
+                    for d in self.db.list_decision_requests(
+                        goal_id=goal.goal_id, subgoal_id=cur_sg.subgoal_id, status="RESOLVED", limit=10
+                    )
+                    if str(d.get("role") or "") == ScientificRole.RESEARCH_LEAD.value
+                ]
+                already_triaged = any(
+                    float(d.get("resolved_ts") or d.get("created_ts") or 0.0) >= latest_activity_ts
+                    for d in resolved_sg_decs
+                )
+                triage_exhausted = any(h.status == "NEEDS_REPAIR" for h in sg_hyps) and all(
+                    int((h.budget_state or {}).get("triage_decisions_used", 0) or 0)
+                    >= int((h.budget_state or {}).get("max_triage_decisions", 2) or 2)
+                    for h in sg_hyps
+                    if h.status == "NEEDS_REPAIR"
+                )
+                if not already_triaged and not triage_exhausted:
+                    if goal.autonomy_mode == "unattended" and not self.db.is_budget_exhausted(goal.goal_id):
+                        dreq = self._enqueue_subgoal_decision(
+                            goal,
+                            role=ScientificRole.RESEARCH_LEAD,
+                            tier="L1",
+                            trigger_kind="EVIDENCE_UPDATE",
+                            subgoal_id=cur_sg.subgoal_id,
+                            urgency="IMMEDIATE",
+                            coalesce_window_s=0.0,
+                            payload={"subgoal_id": cur_sg.subgoal_id, "wave_drained": True},
+                        )
+                        pending_or_running_decs.append(dreq)
+                        summary["decisions_enqueued"] = summary.get("decisions_enqueued", 0) + 1
+                    return False
+                all_stalled = True
+
+            if all_stalled:
+                awaiting_sg = self.db.transition_subgoal_status(
+                    cur_sg.subgoal_id,
+                    SubGoalStatus.ACTIVE.value,
+                    SubGoalStatus.AWAITING_APEX.value,
+                    params_patch={"awaiting_apex_reason": "wave_drained_all_terminal_or_stalled"},
+                )
+                sg_by_id[cur_sg.subgoal_id] = awaiting_sg
+                summary["subgoals_awaiting_apex"] = summary.get("subgoals_awaiting_apex", 0) + 1
+                self._record_ledger_event(
+                    "SUBGOAL_AWAITING_APEX",
+                    goal_id=goal.goal_id,
+                    payload={"subgoal_id": cur_sg.subgoal_id},
+                )
+                _maybe_enqueue_apex(
+                    awaiting_sg,
+                    "subgoal_awaiting_apex",
+                    {"awaiting_subgoal_id": cur_sg.subgoal_id},
+                )
+            return False
+
+        # 2. Reconcile ACTIVE SubGoals and cascade newly unlocked downstream SubGoals in one step
+        pending_check: list[SubGoalNode] = list(subgoals)
+        while pending_check:
+            sealed_any = False
+            for sg in pending_check:
+                cur_sg = sg_by_id.get(sg.subgoal_id, sg)
+                if str(cur_sg.status).upper() != SubGoalStatus.ACTIVE.value:
+                    continue
+                if _reconcile_one_active_subgoal(cur_sg):
+                    sealed_any = True
+            if not sealed_any:
+                break
+            pending_check = self._unlock_ready_subgoals(
+                goal, subgoals, sg_by_id, hyps_by_sg, tasks_by_hyp, wfs_by_hyp, summary
+            )
+
     def _maybe_propose_round(self, goal: ResearchGoal, summary: dict[str, Any]) -> None:
         ctx = self._goal_ctx(goal.goal_id)
         ctx.last_step_ts = time.time()
@@ -1804,6 +2394,113 @@ class ResearchController:
         hyps = self.db.list_hypotheses(goal_id=goal.goal_id)
         ready_tasks = self.db.list_ready_tasks(goal_id=goal.goal_id)
         receipts_count = len(self.db.list_receipts(goal_id=goal.goal_id))
+        subgoals = (
+            self.db.list_subgoals(goal_id=goal.goal_id)
+            if hasattr(self.db, "list_subgoals")
+            else []
+        )
+
+        # SubGoal-managed Goals: wave-gated tracks suppress per-receipt EVIDENCE_UPDATE LLM calls while active tasks remain
+        if subgoals:
+            if goal.autonomy_mode == "supervised":
+                ctx.decision_blocked = True
+                return
+            if self.db.is_budget_exhausted(goal.goal_id):
+                self.flag_owner_escalation(
+                    goal.goal_id,
+                    OWNER_GATE_PAID_COMPUTE,
+                    "Token budget exhausted; owner approval required to raise budget",
+                )
+                return
+            if (
+                not self.dry_run_llm
+                and self.propose_mode in ("auto", "ai")
+                and self.execution_mode == "hq"
+            ):
+                all_goal_tasks = self.db.list_tasks(goal_id=goal.goal_id)
+                all_goal_receipts = self.db.list_receipts(goal_id=goal.goal_id)
+                active_decs = [
+                    d
+                    for d in self.db.list_decision_requests(goal_id=goal.goal_id)
+                    if d.get("status") in ("PENDING", "SUBMITTING", "RUNNING")
+                ]
+                for sg in subgoals:
+                    if str(sg.status).upper() != "ACTIVE" or bool(sg.wave_gated):
+                        continue
+                    sg_hids = {
+                        h.hypothesis_id
+                        for h in hyps
+                        if self._hyp_subgoal_id(h) == sg.subgoal_id
+                    }
+                    if not sg_hids:
+                        continue
+                    sg_rcpts = sum(1 for r in all_goal_receipts if r.hypothesis_id in sg_hids)
+                    sg_ready = sum(
+                        1
+                        for t in all_goal_tasks
+                        if t.hypothesis_id in sg_hids and t.status == "READY"
+                    )
+                    if sg_rcpts == 0 or sg_ready >= max(1, goal.max_concurrent_branches):
+                        continue
+                    has_sg_dec = any(
+                        (d.get("subgoal_id") or (d.get("payload") or {}).get("subgoal_id")) == sg.subgoal_id
+                        for d in active_decs
+                    )
+                    last_sg_rcpt_key = f"sg_rcpt_cnt:{sg.subgoal_id}"
+                    prev_sg_rcpts = int((sg.params or {}).get(last_sg_rcpt_key, 0) or 0)
+                    if not has_sg_dec and sg_rcpts > prev_sg_rcpts:
+                        self._enqueue_subgoal_decision(
+                            goal,
+                            role=ScientificRole.RESEARCH_LEAD,
+                            tier="L1",
+                            trigger_kind="EVIDENCE_UPDATE",
+                            subgoal_id=sg.subgoal_id,
+                            urgency="COALESCED",
+                            coalesce_window_s=self.decision_coalesce_window_s,
+                            payload={"subgoal_id": sg.subgoal_id, "receipts_count": sg_rcpts},
+                        )
+                        with contextlib.suppress(Exception):
+                            self.db.update_subgoal_fields(
+                                sg.subgoal_id,
+                                {"params": {**dict(sg.params), last_sg_rcpt_key: sg_rcpts}},
+                            )
+                        summary["decisions_enqueued"] = summary.get("decisions_enqueued", 0) + 1
+            return
+
+        # Opt-in INITIAL_SUBGOAL_SPLIT when enable_subgoals is truthy and no subgoals/hypotheses exist yet
+        if (
+            not subgoals
+            and len(hyps) == 0
+            and bool((goal.routing_policy or {}).get("enable_subgoals"))
+            and self.propose_mode in ("auto", "ai")
+        ):
+            if goal.autonomy_mode == "supervised":
+                ctx.decision_blocked = True
+                return
+            if self.db.is_budget_exhausted(goal.goal_id):
+                self.flag_owner_escalation(
+                    goal.goal_id,
+                    OWNER_GATE_PAID_COMPUTE,
+                    "Token budget exhausted; owner approval required to raise budget",
+                )
+                return
+            pending_or_running = [
+                d
+                for d in self.db.list_decision_requests(goal_id=goal.goal_id)
+                if d.get("status") in ("PENDING", "SUBMITTING", "RUNNING")
+            ]
+            if not pending_or_running:
+                self._enqueue_subgoal_decision(
+                    goal,
+                    role=ScientificRole.RESEARCH_DIRECTOR,
+                    tier="L2",
+                    trigger_kind="INITIAL_SUBGOAL_SPLIT",
+                    urgency="IMMEDIATE",
+                    coalesce_window_s=0.0,
+                    payload={"initial_subgoal_split": True, "director_adjudication": True},
+                )
+                summary["decisions_enqueued"] = summary.get("decisions_enqueued", 0) + 1
+            return
 
         # No batch barrier: trigger when initial round OR ready queue < max_concurrent_branches & new evidence arrived
         is_initial = len(hyps) == 0
@@ -1812,7 +2509,29 @@ class ResearchController:
             and receipts_count > ctx.last_propose_receipt_count
             and len(ready_tasks) < max(1, goal.max_concurrent_branches)
         )
-        if not is_initial and not has_new_evidence:
+        needs_starvation_recovery = False
+        if (
+            not is_initial
+            and not has_new_evidence
+            and len(ready_tasks) == 0
+            and receipts_count > 0
+            and any(h.status in ("PENDING", "NEEDS_REPAIR") for h in hyps)
+        ):
+            goal_tasks = self.db.list_tasks(goal_id=goal.goal_id)
+            if not any(t.status in ("READY", "DISPATCHED", "RUNNING") for t in goal_tasks):
+                recent_decs = self.db.list_decision_requests(goal_id=goal.goal_id, limit=5)
+                if recent_decs and not any(
+                    d.get("status") in ("PENDING", "SUBMITTING", "RUNNING") for d in recent_decs
+                ):
+                    latest_d = recent_decs[0]
+                    latest_st = str(latest_d.get("status") or "")
+                    latest_ts = float(latest_d.get("updated_ts") or latest_d.get("created_ts") or 0.0)
+                    if (
+                        latest_st in ("FAILED", "DISCARDED_BY_NEWER_HUMAN_INTERVENTION")
+                        and (time.time() - latest_ts) >= 120.0
+                    ):
+                        needs_starvation_recovery = True
+        if not is_initial and not has_new_evidence and not needs_starvation_recovery:
             return
 
         if goal.autonomy_mode == "supervised":
@@ -1854,7 +2573,7 @@ class ResearchController:
             if (
                 not pending_or_running
                 and receipts_count > 0
-                and receipts_count > ctx.last_decision_receipt_count
+                and (receipts_count > ctx.last_decision_receipt_count or needs_starvation_recovery)
             ):
                 role = ScientificRole.RESEARCH_LEAD
                 tier = "L1"
@@ -1865,7 +2584,7 @@ class ResearchController:
                     trigger_kind="EVIDENCE_UPDATE",
                     urgency="COALESCED",
                     coalesce_window_s=self.decision_coalesce_window_s,
-                    payload={"receipts_count": receipts_count},
+                    payload={"receipts_count": receipts_count, "starvation_recovery": needs_starvation_recovery},
                 )
                 ctx.last_decision_receipt_count = receipts_count
                 ctx.last_propose_receipt_count = receipts_count
@@ -2615,6 +3334,156 @@ class ResearchController:
                         summary=summary,
                     )
 
+        # 1.5. Bounded single retry for INFRA_TRANSIENT / LEASE_MISMATCH FAILED decisions (attempt < 2)
+        resolved_by_goal: dict[str, list[dict[str, Any]]] = {}
+        for req in self.db.list_decision_requests(status="FAILED"):
+            try:
+                rid = str(req["req_id"])
+                gid = str(req["goal_id"])
+                goal = goals_by_id.get(gid)
+                if goal is None or goal.autonomy_mode != "unattended":
+                    continue
+                pl = dict(req.get("payload") or {})
+                res = dict(req.get("resolution") or {})
+                req_att = max(1, int(pl.get("attempt", req.get("attempt", 1)) or 1))
+                req_ck = str(req.get("coalesce_key") or "")
+                req_created_ts = float(req.get("created_ts") or 0.0)
+                req_role = str(req.get("role") or "")
+                req_trig = str(req.get("trigger_kind") or "")
+                req_hid = str(pl.get("hypothesis_id") or "")
+
+                if gid not in resolved_by_goal:
+                    resolved_by_goal[gid] = self.db.list_decision_requests(
+                        goal_id=gid, status="RESOLVED", limit=50
+                    )
+                newer_resolved = any(
+                    float(d.get("resolved_ts") or d.get("created_ts") or 0.0) > req_created_ts
+                    and str(d.get("role") or "") == req_role
+                    and str(d.get("trigger_kind") or "") == req_trig
+                    and (
+                        (req_ck and str(d.get("coalesce_key") or "") == req_ck)
+                        or str((d.get("payload") or {}).get("hypothesis_id") or "") == req_hid
+                    )
+                    for d in resolved_by_goal[gid]
+                )
+                if newer_resolved:
+                    self.db.resolve_decision_request(
+                        rid,
+                        status="SUPERSEDED_FAILED",
+                        expected_statuses="FAILED",
+                        now=now,
+                    )
+                    summary["superseded_stale_failed_decisions"] = (
+                        summary.get("superseded_stale_failed_decisions", 0) + 1
+                    )
+                    continue
+
+                if req_att >= 2:
+                    continue
+                req_plan_epoch = pl.get("plan_epoch")
+                if (
+                    int(goal.version) != int(req["goal_version"])
+                    or int(goal.human_epoch) != int(req["human_epoch"])
+                    or (
+                        req_plan_epoch is not None
+                        and int(getattr(goal, "plan_epoch", 0) or 0) != int(req_plan_epoch)
+                    )
+                ):
+                    continue
+                reason_str = str(res.get("reason") or "")
+                fdom_str = str(res.get("failure_domain") or "")
+                is_transient = (
+                    fdom_str == FailureDomain.INFRA_TRANSIENT.value
+                    or reason_str in ("LEASE_MISMATCH", "LEASE_CONFLICT")
+                    or "exited with code 124" in reason_str.lower()
+                )
+                if not is_transient:
+                    continue
+
+                active_for_goal = (
+                    self.db.list_decision_requests(goal_id=gid, status="PENDING")
+                    + self.db.list_decision_requests(goal_id=gid, status="SUBMITTING")
+                    + self.db.list_decision_requests(goal_id=gid, status="RUNNING")
+                )
+                active_same = [
+                    d
+                    for d in active_for_goal
+                    if (
+                        (req_ck and str(d.get("coalesce_key") or "") == req_ck)
+                        or str((d.get("payload") or {}).get("retried_from_req_id") or "") == rid
+                        or (
+                            not req_ck
+                            and str(d.get("trigger_kind") or "") == req_trig
+                            and str(d.get("role") or "") == req_role
+                            and str((d.get("payload") or {}).get("hypothesis_id") or "") == req_hid
+                        )
+                    )
+                ]
+                if active_same:
+                    continue
+
+                failed_spec = str(res.get("model_used") or req.get("model_spec") or "").strip()
+                excl = [str(x).strip() for x in (pl.get("exclude_specs") or []) if str(x).strip()]
+                pinned_strength = str((pl.get("pinned_route") or {}).get("strength") or "").strip()
+                if (
+                    failed_spec
+                    and failed_spec not in excl
+                    and pinned_strength != ConstraintStrength.HARD.value
+                ):
+                    excl.append(failed_spec)
+                retry_pl = {
+                    k: v
+                    for k, v in pl.items()
+                    if k
+                    not in {
+                        "pinned_route",
+                        "lease_id",
+                        "submit_nonce",
+                        "usage_key",
+                        "submit_job_name",
+                        "submit_owner_pid",
+                        "submit_proc_start_time",
+                        "submitting_started_ts",
+                        "model_spec",
+                    }
+                }
+                retry_pl["attempt"] = req_att + 1
+                retry_pl["exclude_specs"] = excl
+                retry_pl["retried_from_req_id"] = rid
+                retry_pl["retry_reason"] = reason_str[:160]
+
+                with self.db._tx():
+                    self.db.resolve_decision_request(
+                        rid,
+                        status="SUPERSEDED_FAILED",
+                        expected_statuses="FAILED",
+                        now=now,
+                    )
+                    self.db.enqueue_decision_request(
+                        gid,
+                        tier=str(req.get("tier") or "L1"),
+                        role=req.get("role") or ScientificRole.RESEARCH_LEAD.value,
+                        attempt=req_att + 1,
+                        trigger_kind=str(req.get("trigger_kind") or "EVIDENCE_UPDATE"),
+                        goal_version=int(req["goal_version"]),
+                        human_epoch=int(req["human_epoch"]),
+                        coalesce_key=req_ck,
+                        coalesce_window_s=0.0,
+                        payload=retry_pl,
+                        req_id=f"{rid}_r{req_att + 1}",
+                        now=now,
+                    )
+                summary["retried_infra_decisions"] = summary.get("retried_infra_decisions", 0) + 1
+            except StateTransitionError:
+                continue
+            except Exception as exc:
+                self._isolate_step_exception(
+                    exc,
+                    phase="retry_failed_infra_decision",
+                    goal_id=str(req.get("goal_id") or "") or None,
+                    summary=summary,
+                )
+
         # 2. Enqueue initial work for RESOLVED decisions
         for req in self.db.list_decision_requests(status="RESOLVED", limit=100):
             rid = str(req["req_id"])
@@ -2708,11 +3577,19 @@ class ResearchController:
                 continue
 
             try:
+                is_subgoal_or_apex = bool(
+                    req.get("subgoal_id")
+                    or (req.get("payload") or {}).get("subgoal_id")
+                    or str(req.get("trigger_kind") or "")
+                    in ("APEX_PORTFOLIO_REVIEW", "INITIAL_SUBGOAL_SPLIT")
+                )
                 if self.execution_mode == "hq" and not self.dry_run_llm:
                     self.decision_engine.submit_decision_to_hq(
                         str(req["req_id"]), arr_home=self.arr_home
                     )
                     summary["decisions_submitted"] = summary.get("decisions_submitted", 0) + 1
+                elif self.dry_run_llm and is_subgoal_or_apex:
+                    continue
                 else:
                     out = self.decision_engine.process_request(
                         str(req["req_id"]), dry_run_llm=self.dry_run_llm
@@ -2811,7 +3688,14 @@ class ResearchController:
                 f"Token budget exhausted for goal {goal.goal_id}",
             )
         hyps = self.db.list_hypotheses(goal_id=goal.goal_id)
-        if hyps:
+        has_open_subgoals = False
+        if hasattr(self.db, "list_subgoals"):
+            sgs_esc = self.db.list_subgoals(goal_id=goal.goal_id)
+            has_open_subgoals = any(
+                str(sg.status).upper() in ("ACTIVE", "LOCKED_DEP", "PAUSED", "AWAITING_APEX")
+                for sg in sgs_esc
+            )
+        if hyps and not has_open_subgoals:
             routes = [h for h in hyps if h.kind == HypothesisKind.COMPETING_ROUTE]
             if routes and all(
                 h.status in ("REFUTED", "GRAVEYARD", "ESCALATED")
@@ -2872,10 +3756,54 @@ class ResearchController:
 
         hyps_by_id: dict[str, HypothesisNode] = {}
         recent_receipts_by_goal: dict[str, int] = {}
+        subgoals_by_id: dict[str, SubGoalNode] = {}
+        tokens_by_subgoal: dict[str, int] = {}
+        has_subgoals_lookup = hasattr(self.db, "list_subgoals")
         for gid in goals_by_id:
             for h in self.db.list_hypotheses(goal_id=gid):
                 hyps_by_id[h.hypothesis_id] = h
-            recent_receipts_by_goal[gid] = len(self.db.list_receipts(goal_id=gid))
+            goal_rcpts = self.db.list_receipts(goal_id=gid)
+            recent_receipts_by_goal[gid] = len(goal_rcpts)
+            if has_subgoals_lookup:
+                for sg in self.db.list_subgoals(goal_id=gid):
+                    subgoals_by_id[sg.subgoal_id] = sg
+                for r in goal_rcpts:
+                    rh = hyps_by_id.get(r.hypothesis_id)
+                    rsg = self._hyp_subgoal_id(rh)
+                    if rsg:
+                        tokens_by_subgoal[rsg] = (
+                            tokens_by_subgoal.get(rsg, 0)
+                            + int(r.in_tokens)
+                            + int(r.out_tokens)
+                        )
+
+        active_by_subgoal: dict[str, int] = {}
+        if subgoals_by_id:
+            for rt in running_tasks:
+                rsg = self._hyp_subgoal_id(hyps_by_id.get(rt.hypothesis_id))
+                if rsg:
+                    active_by_subgoal[rsg] = active_by_subgoal.get(rsg, 0) + 1
+
+            def _task_subgoal_runnable(t: StageTask) -> bool:
+                sg_id = self._hyp_subgoal_id(hyps_by_id.get(t.hypothesis_id))
+                if not sg_id or sg_id not in subgoals_by_id:
+                    return True
+                sg = subgoals_by_id[sg_id]
+                if str(sg.status).upper() != SubGoalStatus.ACTIVE.value:
+                    return False
+                if int(sg.max_tokens_budget or 0) > 0:
+                    needs_llm = bool(
+                        t.resources.llm_pool
+                        or (isinstance(t.pinned_route, Mapping) and t.pinned_route.get("pool"))
+                        or t.stage in READONLY_REVIEW_STAGES
+                    )
+                    if needs_llm and tokens_by_subgoal.get(sg_id, 0) >= int(sg.max_tokens_budget):
+                        return False
+                return True
+
+            ready_all = [t for t in ready_all if _task_subgoal_runnable(t)]
+            if not ready_all:
+                return
 
         blocked_goals: set[str] = set()
         pending_decs = {
@@ -2934,6 +3862,34 @@ class ResearchController:
             total_slots=total_slots,
             arr_home=self.arr_home,
         )
+        if subgoals_by_id:
+            sg_pos_counter: dict[str, int] = {}
+            for item in ranked_items:
+                sg_id = self._hyp_subgoal_id(item["hyp"])
+                sg_obj = subgoals_by_id.get(sg_id) if sg_id else None
+                if sg_obj is not None and sg_id is not None:
+                    pos = sg_pos_counter.get(sg_id, 0)
+                    sg_pos_counter[sg_id] = pos + 1
+                    sg_weight = max(0.05, float(getattr(sg_obj, "priority_weight", 1.0) or 1.0))
+                    sg_load = 1.0 + float(active_by_subgoal.get(sg_id, 0)) + float(pos)
+                    item["subgoal_id"] = sg_id
+                    item["subgoal_priority_weight"] = sg_weight
+                    item["subgoal_idle_slot"] = 1 if (active_by_subgoal.get(sg_id, 0) == 0 and pos == 0) else 0
+                    item["subgoal_weighted_score"] = (float(item["score"]) * sg_weight) / sg_load
+                else:
+                    item["subgoal_id"] = None
+                    item["subgoal_priority_weight"] = 1.0
+                    item["subgoal_idle_slot"] = 0
+                    item["subgoal_weighted_score"] = float(item["score"])
+            ranked_items.sort(
+                key=lambda item: (
+                    -int(item["below_floor"]),
+                    -int(item["subgoal_idle_slot"]),
+                    -float(item["subgoal_weighted_score"]),
+                    float(item["task"].enqueued_ts or 0.0),
+                    item["task"].task_id,
+                )
+            )
         queued_projects = [goals_by_id[item["task"].goal_id].project for item in ranked_items]
 
         if self.execution_mode == "hq":
@@ -3408,6 +4364,9 @@ class ResearchController:
                 )
                 ConflictManager.release_task_leases(self.db, task.task_id, now=end_ts)
                 active_leases = self.db.list_active_leases(now=end_ts)
+                disp_sg = self._hyp_subgoal_id(hyp)
+                if disp_sg and subgoals_by_id:
+                    active_by_subgoal[disp_sg] = active_by_subgoal.get(disp_sg, 0) + 1
                 summary["tasks_dispatched"] += 1
             else:
                 cmd = [
@@ -3511,6 +4470,9 @@ class ResearchController:
                 active_leases.extend(scope_leases)
                 active_by_project[goal.project] = active_by_project.get(goal.project, 0) + 1
                 active_by_goal[goal.goal_id] = active_by_goal.get(goal.goal_id, 0) + 1
+                disp_sg = self._hyp_subgoal_id(hyp)
+                if disp_sg and subgoals_by_id:
+                    active_by_subgoal[disp_sg] = active_by_subgoal.get(disp_sg, 0) + 1
                 summary["tasks_dispatched"] += 1
 
     def _recover_resumed_goal_tasks(
@@ -4009,6 +4971,15 @@ class ResearchController:
                         with contextlib.suppress(Exception):
                             self._mark_task_handled(task)
 
+        # 1.5. Reconcile SubGoal dependencies, wave sealing, and TrackLead / Apex triggers
+        for goal in goals:
+            try:
+                self._reconcile_subgoals_for_goal(goal, summary)
+            except Exception as exc:
+                self._isolate_step_exception(
+                    exc, phase="reconcile_subgoals_for_goal", goal_id=goal.goal_id, summary=summary
+                )
+
         # 2. Per-Goal non-blocking propose/decision & escalation checks
         for goal in goals:
             try:
@@ -4081,6 +5052,15 @@ class ResearchController:
         }
         self.pid_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
+    def _owns_pid_lock(self) -> bool:
+        try:
+            if not self.pid_path.exists():
+                return True
+            doc = json.loads(self.pid_path.read_text(encoding="utf-8"))
+            return int(doc.get("pid", 0)) == os.getpid()
+        except Exception:
+            return False
+
     def _release_pid_lock(self) -> None:
         try:
             if self.pid_path.exists():
@@ -4089,6 +5069,10 @@ class ResearchController:
                     self.pid_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+    def _release_sock_if_owned(self) -> None:
+        if self._owns_pid_lock():
+            self.sock_path.unlink(missing_ok=True)
 
     def stop(self) -> None:
         """Signal the reactor loop to exit cleanly and wake select() immediately."""
@@ -4120,7 +5104,7 @@ class ResearchController:
 
             if self.sock_path.exists():
                 self.sock_path.unlink(missing_ok=True)
-            stack.callback(lambda: self.sock_path.unlink(missing_ok=True))
+            stack.callback(self._release_sock_if_owned)
 
             srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             stack.callback(srv.close)

@@ -40,6 +40,9 @@ from conjectra.types import (
     ScientificVerdict,
     StageKind,
     StageTask,
+    SubGoalKind,
+    SubGoalNode,
+    SubGoalStatus,
     WorkflowNode,
 )
 
@@ -959,22 +962,31 @@ class GlobalGoalManager:
         *,
         reason: str,
         hypothesis_ids: set[str] | None = None,
+        subgoal_id: str | None = None,
         epoch: int = 0,
         plan_epoch: int = 0,
     ) -> tuple[list[str], list[int]]:
         """Cancel active (`PENDING`/`RUNNING`) `dec-*` DecisionRequests and persist durable HQ cancellations."""
         cancelled_reqs: list[str] = []
         hq_job_ids: list[int] = []
-        hq_dec_meta: list[tuple[int, str, int]] = []
+        hq_dec_meta: list[tuple[int, str, int, str]] = []
         now = time.time()
         for st in ("PENDING", "SUBMITTING", "RUNNING"):
             for req in self.db.list_decision_requests(goal_id=goal_id, status=st):
                 pbody = req.get("payload") or {}
                 rhid = pbody.get("hypothesis_id") or pbody.get("target_hypothesis_id")
-                if hypothesis_ids is not None and rhid and str(rhid) not in hypothesis_ids:
-                    continue
-                if hypothesis_ids is not None and not rhid:
-                    continue
+                rsg_id = str(req.get("subgoal_id") or pbody.get("subgoal_id") or "").strip() or None
+                if subgoal_id is not None:
+                    matches_sg = rsg_id == subgoal_id or (
+                        hypothesis_ids is not None and rhid and str(rhid) in hypothesis_ids
+                    )
+                    if not matches_sg:
+                        continue
+                elif hypothesis_ids is not None:
+                    if rhid and str(rhid) not in hypothesis_ids:
+                        continue
+                    if not rhid:
+                        continue
                 rid = str(req["req_id"])
                 req_att_c = int(pbody.get("attempt", req.get("attempt", 1)) or 1)
                 self.db.resolve_decision_request(
@@ -3292,9 +3304,19 @@ class GlobalGoalManager:
             else:
                 raise ValueError(f"Unsupported {scp} intervention action: {action!r}")
 
+        elif scp == "subgoal":
+            result, before_epoch, after_epoch = self._apply_subgoal_intervention(
+                act,
+                goal_id=goal_id,
+                target_id=target_id,
+                body=body,
+                actor=actor,
+                reason=reason,
+            )
+
         else:
             raise ValueError(
-                f"Invalid scope {scope!r}; expected one of 'global', 'goal', 'branch', 'workflow', 'task'"
+                f"Invalid scope {scope!r}; expected one of 'global', 'goal', 'subgoal', 'branch', 'workflow', 'task'"
             )
 
         intervention_rec = self.db.record_intervention(
@@ -3665,6 +3687,760 @@ class GlobalGoalManager:
                 before_epoch,
                 after_epoch,
             )
+
+    def _require_subgoal(
+        self,
+        goal_id: str | None,
+        target_id: str | None,
+        body: Mapping[str, Any],
+    ) -> tuple[ResearchGoal, SubGoalNode]:
+        sg_id = str(target_id or body.get("subgoal_id") or "").strip()
+        if not sg_id:
+            raise ValueError("subgoal intervention requires target_id (subgoal_id)")
+        sg = (
+            self.db.get_goal_subgoal(goal_id, sg_id)
+            if goal_id
+            else self.db.get_subgoal(sg_id)
+        )
+        if sg is None:
+            raise KeyError(f"Unknown subgoal_id: {sg_id}")
+        goal = self._require_goal(goal_id or sg.goal_id)
+        return goal, sg
+
+    def _subgoal_hypotheses(self, goal_id: str, subgoal_id: str) -> list[HypothesisNode]:
+        hyps = self.db.list_hypotheses(goal_id=goal_id)
+        out: list[HypothesisNode] = []
+        for h in hyps:
+            h_sg = getattr(h, "subgoal_id", None) or (
+                (h.params or {}).get("subgoal_id") if isinstance(h.params, Mapping) else None
+            )
+            if h_sg == subgoal_id:
+                out.append(h)
+        return out
+
+    def _is_hq_job_terminated(
+        self,
+        goal_id: str,
+        jid: int | None,
+        ent_id: str = "",
+        *,
+        entity_kind: str | None = None,
+        attempt: int | None = None,
+        now: float | None = None,
+    ) -> bool:
+        if jid is None:
+            return True
+        ts = time.time() if now is None else float(now)
+        if hasattr(self.db, "list_pending_hq_cancellations"):
+            confirmed_rows = self.db.list_pending_hq_cancellations(
+                goal_id=goal_id, state="CANCEL_CONFIRMED"
+            )
+            if any(
+                int(r.get("hq_job_id", -1)) == int(jid)
+                and (not entity_kind or not r.get("entity_kind") or str(r.get("entity_kind")) == entity_kind)
+                and (not ent_id or not r.get("entity_id") or str(r.get("entity_id")) == ent_id)
+                and (attempt is None or not r.get("attempt") or int(r.get("attempt") or 0) == int(attempt))
+                for r in confirmed_rows
+            ):
+                return True
+        q_state = self._query_hq_job_state(self.hq, int(jid))
+        lookup_status = str(q_state.get("lookup_status") or "QUERY_ERROR").upper()
+        if lookup_status == "FOUND":
+            if self._hq_positively_terminated(self.hq, int(jid), prefetched_info=q_state.get("job")):
+                if hasattr(self.db, "confirm_hq_cancellation"):
+                    self.db.confirm_hq_cancellation(
+                        int(jid), entity_kind=entity_kind, entity_id=ent_id or None, attempt=attempt, now=ts
+                    )
+                return True
+            return False
+        if lookup_status == "NOT_FOUND":
+            has_live_lease = bool(
+                ent_id
+                and any(
+                    str(ls.get("task_id") or "") in {ent_id, f"dec-{ent_id}"}
+                    for ls in self.db.list_active_leases(now=ts)
+                )
+            )
+            if not has_live_lease:
+                if hasattr(self.db, "confirm_hq_cancellation"):
+                    self.db.confirm_hq_cancellation(
+                        int(jid), entity_kind=entity_kind, entity_id=ent_id or None, attempt=attempt, now=ts
+                    )
+                return True
+        return False
+
+    def _apply_subgoal_intervention(
+        self,
+        act: str,
+        *,
+        goal_id: str | None,
+        target_id: str | None,
+        body: Mapping[str, Any],
+        actor: str,
+        reason: str,
+    ) -> tuple[dict[str, Any], int | None, int | None]:
+        """Atomically execute SubGoal interventions (`pause`, `resume`, `kill`, `retune`, `merge`, `spawn`)."""
+        now = time.time()
+        with self.db._tx():
+            if act == "pause":
+                goal, sg = self._require_subgoal(goal_id, target_id, body)
+                if str(sg.status).upper() in (SubGoalStatus.KILLED.value, SubGoalStatus.MERGED.value):
+                    raise StateTransitionError(
+                        f"Cannot pause subgoal {sg.subgoal_id} in terminal status {sg.status!r}"
+                    )
+                sg_hyps = self._subgoal_hypotheses(goal.goal_id, sg.subgoal_id)
+                sg_hids = {h.hypothesis_id for h in sg_hyps}
+                all_tasks = self.db.list_tasks(goal_id=goal.goal_id)
+                running_tasks = [
+                    t
+                    for t in all_tasks
+                    if t.hypothesis_id in sg_hids and t.status in ("DISPATCHED", "RUNNING")
+                ]
+                paused_records = [t.to_dict() for t in running_tasks]
+                cancelled_tasks: list[str] = []
+                cancelled_hq: list[int] = []
+                if bool(body.get("cancel_running", True)) and running_tasks:
+                    cancelled_tasks, cancelled_hq = self._cancel_tasks_and_hq(
+                        running_tasks,
+                        reason=reason or f"subgoal_paused:{sg.subgoal_id}:{actor}",
+                        epoch=int(goal.human_epoch) + 1,
+                        plan_epoch=int(getattr(goal, "plan_epoch", 0) or 0),
+                    )
+                cancelled_decs, dec_hq = self._cancel_decisions_and_hq(
+                    goal.goal_id,
+                    reason=reason or f"subgoal_paused:{sg.subgoal_id}:{actor}",
+                    hypothesis_ids=sg_hids,
+                    subgoal_id=sg.subgoal_id,
+                    epoch=int(goal.human_epoch) + 1,
+                    plan_epoch=int(getattr(goal, "plan_epoch", 0) or 0),
+                )
+                cancelled_hq.extend(dec_hq)
+
+                by_wf: dict[str, list[dict[str, Any]]] = {}
+                standalone_paused: list[dict[str, Any]] = []
+                for snap in paused_records:
+                    wf_id = snap.get("workflow_id")
+                    if wf_id:
+                        by_wf.setdefault(str(wf_id), []).append(snap)
+                    else:
+                        standalone_paused.append(snap)
+
+                paused_wfs: list[str] = []
+                for wf in self.db.list_workflows(goal_id=goal.goal_id):
+                    if wf.hypothesis_id in sg_hids and wf.status in ("READY", "RUNNING", "WAITING"):
+                        patch: dict[str, Any] = {
+                            "paused_prev_status": wf.status,
+                            "paused_by_subgoal": sg.subgoal_id,
+                        }
+                        if wf.workflow_id in by_wf:
+                            patch["paused_tasks"] = list(wf.state.get("paused_tasks") or []) + by_wf[wf.workflow_id]
+                        self.db.update_workflow_state(
+                            wf.workflow_id, status="PAUSED", state_patch=patch, now=now
+                        )
+                        paused_wfs.append(wf.workflow_id)
+
+                if standalone_paused:
+                    self.db.upsert_knowledge_item(
+                        goal.goal_id,
+                        "paused_subgoal_tasks",
+                        sg.subgoal_id,
+                        {"tasks": standalone_paused, "paused_ts": now},
+                        goal_version=int(goal.version),
+                        now=now,
+                    )
+
+                prev_st = str(sg.status)
+                self.db.transition_subgoal_status(
+                    sg.subgoal_id,
+                    None,
+                    SubGoalStatus.PAUSED.value,
+                    params_patch={
+                        "paused_prev_status": prev_st if prev_st != SubGoalStatus.PAUSED.value else (sg.params or {}).get("paused_prev_status", SubGoalStatus.ACTIVE.value),
+                        "paused_reason": reason,
+                        "paused_by": actor,
+                    },
+                    now=now,
+                )
+                unaffected_ids = {
+                    t.task_id
+                    for t in all_tasks
+                    if t.status in ACTIVE_TASK_STATUSES and t.hypothesis_id not in sg_hids
+                }
+                _, before_epoch, after_epoch = self._bump_goal_epoch(
+                    goal, sync_unaffected_task_ids=unaffected_ids
+                )
+                return (
+                    {
+                        "goal_id": goal.goal_id,
+                        "subgoal_id": sg.subgoal_id,
+                        "status": SubGoalStatus.PAUSED.value,
+                        "previous_status": prev_st,
+                        "paused_workflow_ids": paused_wfs,
+                        "cancelled_task_ids": cancelled_tasks,
+                        "cancelled_hq_job_ids": cancelled_hq,
+                        "cancelled_decision_ids": cancelled_decs,
+                    },
+                    before_epoch,
+                    after_epoch,
+                )
+
+            if act == "resume":
+                goal, sg = self._require_subgoal(goal_id, target_id, body)
+                if str(sg.status).upper() in (SubGoalStatus.KILLED.value, SubGoalStatus.MERGED.value):
+                    raise StateTransitionError(
+                        f"Cannot resume subgoal {sg.subgoal_id} in terminal status {sg.status!r}"
+                    )
+                sg_hyps = self._subgoal_hypotheses(goal.goal_id, sg.subgoal_id)
+                sg_hids = {h.hypothesis_id for h in sg_hyps}
+                all_tasks = self.db.list_tasks(goal_id=goal.goal_id)
+                sync_ids = {
+                    t.task_id
+                    for t in all_tasks
+                    if t.status in ACTIVE_TASK_STATUSES
+                    and (t.hypothesis_id not in sg_hids or t.status == "READY")
+                }
+                updated_goal, before_epoch, after_epoch = self._bump_goal_epoch(
+                    goal, sync_unaffected_task_ids=sync_ids
+                )
+
+                resumed_wfs: list[str] = []
+                spawned_task_ids: list[str] = []
+                waiting_confirm_ids: list[str] = []
+                for wf in self.db.list_workflows(goal_id=goal.goal_id):
+                    if wf.hypothesis_id in sg_hids and wf.status == "PAUSED":
+                        prev_wf_st = str(wf.state.get("paused_prev_status") or "RUNNING")
+                        paused_snaps = list(wf.state.get("paused_tasks") or [])
+                        rem_snaps: list[dict[str, Any]] = []
+                        for snap in paused_snaps:
+                            jid = snap.get("hq_job_id")
+                            tid_s = str(snap.get("task_id") or "")
+                            att_s = int(snap["attempt"]) if snap.get("attempt") is not None else None
+                            if not self._is_hq_job_terminated(
+                                goal.goal_id,
+                                int(jid) if jid is not None else None,
+                                tid_s,
+                                entity_kind="task",
+                                attempt=att_s,
+                                now=now,
+                            ):
+                                rem_snaps.append({**dict(snap), "wait_reason": "WAIT_CANCEL_CONFIRM"})
+                                if tid_s:
+                                    waiting_confirm_ids.append(tid_s)
+                                continue
+                            repl = self._spawn_replacement_task_from_snapshot(
+                                updated_goal, snap, now=now
+                            )
+                            spawned_task_ids.append(repl.task_id)
+                        self.db.update_workflow_state(
+                            wf.workflow_id,
+                            status=prev_wf_st if prev_wf_st in ("READY", "RUNNING", "WAITING") else "RUNNING",
+                            state_patch={"paused_tasks": rem_snaps},
+                            now=now,
+                        )
+                        resumed_wfs.append(wf.workflow_id)
+
+                for item in self.db.list_knowledge_items(
+                    goal_id=goal.goal_id, category="paused_subgoal_tasks", limit=20
+                ):
+                    if item.get("key") != sg.subgoal_id:
+                        continue
+                    snaps = list((item.get("content") or {}).get("tasks") or [])
+                    if not snaps:
+                        continue
+                    rem_s: list[dict[str, Any]] = []
+                    for snap in snaps:
+                        jid = snap.get("hq_job_id")
+                        tid_s = str(snap.get("task_id") or "")
+                        att_s = int(snap["attempt"]) if snap.get("attempt") is not None else None
+                        if self._is_hq_job_terminated(
+                            goal.goal_id,
+                            int(jid) if jid is not None else None,
+                            tid_s,
+                            entity_kind="task",
+                            attempt=att_s,
+                            now=now,
+                        ):
+                            repl = self._spawn_replacement_task_from_snapshot(
+                                updated_goal, snap, now=now
+                            )
+                            spawned_task_ids.append(repl.task_id)
+                        else:
+                            rem_s.append({**dict(snap), "wait_reason": "WAIT_CANCEL_CONFIRM"})
+                            if tid_s:
+                                waiting_confirm_ids.append(tid_s)
+                    self.db.upsert_knowledge_item(
+                        goal.goal_id,
+                        "paused_subgoal_tasks",
+                        sg.subgoal_id,
+                        {"tasks": rem_s, "resumed_ts": now},
+                        goal_version=int(updated_goal.version),
+                        now=now,
+                    )
+
+                prev_sg_st = str((sg.params or {}).get("paused_prev_status") or SubGoalStatus.ACTIVE.value)
+                if prev_sg_st == SubGoalStatus.LOCKED_DEP.value:
+                    deps = [self.db.get_subgoal(d) for d in (sg.depends_on_subgoals or [])]
+                    all_sealed = all(
+                        dn is not None and str(dn.status).upper() in (SubGoalStatus.SEALED.value, SubGoalStatus.MERGED.value)
+                        for dn in deps
+                    )
+                    target_sg_st = SubGoalStatus.ACTIVE.value if (all_sealed or bool(body.get("force"))) else SubGoalStatus.LOCKED_DEP.value
+                elif prev_sg_st in (SubGoalStatus.ACTIVE.value, SubGoalStatus.AWAITING_APEX.value):
+                    target_sg_st = prev_sg_st
+                else:
+                    target_sg_st = SubGoalStatus.ACTIVE.value
+
+                self.db.transition_subgoal_status(
+                    sg.subgoal_id,
+                    None,
+                    target_sg_st,
+                    params_patch={"resumed_by": actor, "resumed_ts": now},
+                    now=now,
+                )
+                return (
+                    {
+                        "goal_id": goal.goal_id,
+                        "subgoal_id": sg.subgoal_id,
+                        "status": target_sg_st,
+                        "resumed_workflow_ids": resumed_wfs,
+                        "spawned_replacement_task_ids": spawned_task_ids,
+                        "waiting_cancel_confirm_task_ids": waiting_confirm_ids,
+                    },
+                    before_epoch,
+                    after_epoch,
+                )
+
+            if act == "kill":
+                goal, sg = self._require_subgoal(goal_id, target_id, body)
+                sg_hyps = self._subgoal_hypotheses(goal.goal_id, sg.subgoal_id)
+                sg_hids = {h.hypothesis_id for h in sg_hyps}
+                all_tasks = self.db.list_tasks(goal_id=goal.goal_id)
+                sg_tasks = [
+                    t
+                    for t in all_tasks
+                    if t.hypothesis_id in sg_hids and t.status in ACTIVE_TASK_STATUSES
+                ]
+                cancelled_tasks, cancelled_hq = self._cancel_tasks_and_hq(
+                    sg_tasks,
+                    reason=reason or f"subgoal_killed:{sg.subgoal_id}:{actor}",
+                    epoch=int(goal.human_epoch) + 1,
+                    plan_epoch=int(getattr(goal, "plan_epoch", 0) or 0),
+                )
+                cancelled_decs, dec_hq = self._cancel_decisions_and_hq(
+                    goal.goal_id,
+                    reason=reason or f"subgoal_killed:{sg.subgoal_id}:{actor}",
+                    hypothesis_ids=sg_hids,
+                    subgoal_id=sg.subgoal_id,
+                    epoch=int(goal.human_epoch) + 1,
+                    plan_epoch=int(getattr(goal, "plan_epoch", 0) or 0),
+                )
+                cancelled_hq.extend(dec_hq)
+                cancelled_wfs: list[str] = []
+                for wf in self.db.list_workflows(goal_id=goal.goal_id):
+                    if wf.hypothesis_id in sg_hids and wf.status in ACTIVE_WORKFLOW_STATUSES:
+                        self.db.update_workflow_state(
+                            wf.workflow_id,
+                            status="CANCELLED",
+                            state_patch={"cancel_reason": reason or f"subgoal_killed:{sg.subgoal_id}"},
+                            now=now,
+                        )
+                        cancelled_wfs.append(wf.workflow_id)
+                pruned_hyps: list[str] = []
+                for h in sg_hyps:
+                    if h.status not in TERMINAL_HYP_STATUSES and h.status not in ("COMPLETED", "VALID_NEGATIVE"):
+                        self.db.transition_hypothesis_status(
+                            h.hypothesis_id,
+                            h.status,
+                            "PRUNED",
+                            scientific_verdict=ScientificVerdict.NOT_APPLICABLE,
+                            now=now,
+                        )
+                        pruned_hyps.append(h.hypothesis_id)
+                self.db.transition_subgoal_status(
+                    sg.subgoal_id,
+                    None,
+                    SubGoalStatus.KILLED.value,
+                    params_patch={"killed_reason": reason, "killed_by": actor, "killed_ts": now},
+                    now=now,
+                )
+                reallocated_to: list[str] = []
+                raw_realloc = body.get("reallocate_to")
+                if raw_realloc or bool(body.get("reallocate")):
+                    siblings = [
+                        s
+                        for s in self.db.list_subgoals(goal_id=goal.goal_id, status=SubGoalStatus.ACTIVE.value)
+                        if s.subgoal_id != sg.subgoal_id
+                    ]
+                    if raw_realloc:
+                        target_ids = (
+                            [str(raw_realloc)]
+                            if isinstance(raw_realloc, str)
+                            else [str(x) for x in raw_realloc]
+                        )
+                        targets = [s for s in siblings if s.subgoal_id in set(target_ids)]
+                    else:
+                        targets = siblings
+                    if targets:
+                        w_share = float(sg.priority_weight or 0.0) / len(targets)
+                        b_share = int(sg.max_tokens_budget or 0) // len(targets)
+                        for ts_node in targets:
+                            patch_r: dict[str, Any] = {
+                                "priority_weight": float(ts_node.priority_weight) + w_share
+                            }
+                            if b_share > 0:
+                                patch_r["max_tokens_budget"] = int(ts_node.max_tokens_budget or 0) + b_share
+                            self.db.update_subgoal_fields(ts_node.subgoal_id, patch_r, now=now)
+                            reallocated_to.append(ts_node.subgoal_id)
+
+                unaffected_ids = {
+                    t.task_id
+                    for t in all_tasks
+                    if t.status in ACTIVE_TASK_STATUSES and t.hypothesis_id not in sg_hids
+                }
+                _, before_epoch, after_epoch = self._bump_goal_epoch(
+                    goal, sync_unaffected_task_ids=unaffected_ids
+                )
+                return (
+                    {
+                        "goal_id": goal.goal_id,
+                        "subgoal_id": sg.subgoal_id,
+                        "status": SubGoalStatus.KILLED.value,
+                        "cancelled_task_ids": cancelled_tasks,
+                        "cancelled_hq_job_ids": cancelled_hq,
+                        "cancelled_workflow_ids": cancelled_wfs,
+                        "cancelled_decision_ids": cancelled_decs,
+                        "pruned_hypothesis_ids": pruned_hyps,
+                        "reallocated_to": reallocated_to,
+                    },
+                    before_epoch,
+                    after_epoch,
+                )
+
+            if act == "retune":
+                goal, sg = self._require_subgoal(goal_id, target_id, body)
+                allowed_retune = {
+                    "title",
+                    "direction_thesis",
+                    "direct_contribution",
+                    "local_metric",
+                    "target_value",
+                    "baseline_value",
+                    "direction",
+                    "kill_criteria",
+                    "compute_target",
+                    "spec_paths",
+                    "writable_prefixes",
+                    "priority_weight",
+                    "max_tokens_budget",
+                    "max_auto_generations",
+                    "wave_gated",
+                    "base_sha",
+                }
+                patch = {k: v for k, v in body.items() if k in allowed_retune}
+                if "priority_weight" in patch:
+                    pw = float(patch["priority_weight"])
+                    if not math.isfinite(pw) or pw <= 0.0:
+                        raise ValueError("priority_weight must be finite and > 0")
+                    patch["priority_weight"] = pw
+                if "max_tokens_budget" in patch and int(patch["max_tokens_budget"]) < 0:
+                    raise ValueError("max_tokens_budget must be >= 0")
+                if "max_auto_generations" in patch and int(patch["max_auto_generations"]) < 1:
+                    raise ValueError("max_auto_generations must be >= 1")
+                if "direction" in patch and str(patch["direction"]).strip().lower() not in VALID_DIRECTIONS:
+                    raise ValueError(f"Invalid direction: {patch['direction']!r}")
+                updated_sg = self.db.update_subgoal_fields(sg.subgoal_id, patch, now=now) if patch else sg
+                desired_st = body.get("status")
+                if desired_st is not None:
+                    updated_sg = self.db.transition_subgoal_status(
+                        sg.subgoal_id, None, str(desired_st), now=now
+                    )
+                elif (
+                    str(updated_sg.status).upper() == SubGoalStatus.AWAITING_APEX.value
+                    and bool(body.get("reactivate", True))
+                ):
+                    updated_sg = self.db.transition_subgoal_status(
+                        sg.subgoal_id,
+                        SubGoalStatus.AWAITING_APEX.value,
+                        SubGoalStatus.ACTIVE.value,
+                        now=now,
+                    )
+                all_active = {
+                    t.task_id
+                    for t in self.db.list_tasks(goal_id=goal.goal_id)
+                    if t.status in ACTIVE_TASK_STATUSES
+                }
+                _, before_epoch, after_epoch = self._bump_goal_epoch(
+                    goal,
+                    bump_plan_epoch=bool(body.get("bump_plan_epoch", False)),
+                    sync_unaffected_task_ids=all_active,
+                )
+                return (
+                    {
+                        "goal_id": goal.goal_id,
+                        "subgoal_id": updated_sg.subgoal_id,
+                        "status": updated_sg.status,
+                        "subgoal": updated_sg.to_dict(),
+                    },
+                    before_epoch,
+                    after_epoch,
+                )
+
+            if act == "spawn":
+                goal = self._require_goal(goal_id or body.get("goal_id"))
+                sg_id = str(body.get("subgoal_id") or target_id or f"sg_{uuid.uuid4().hex[:10]}").strip()
+                title = str(body.get("title") or "").strip()
+                thesis = str(body.get("direction_thesis") or body.get("thesis") or title).strip()
+                contrib = str(body.get("direct_contribution") or body.get("contribution") or "").strip()
+                local_metric = str(body.get("local_metric") or goal.primary_metric or "").strip()
+                if not title or not thesis or not contrib or not local_metric:
+                    raise ValueError(
+                        "spawn subgoal requires non-empty title, direction_thesis, direct_contribution, and local_metric"
+                    )
+                deps = [str(x).strip() for x in (body.get("depends_on_subgoals") or []) if str(x).strip()]
+                has_unsealed_dep = False
+                dep_sha = ""
+                for d_id in deps:
+                    d_sg = self.db.get_goal_subgoal(goal.goal_id, d_id)
+                    if d_sg is None or str(d_sg.status).upper() not in (
+                        SubGoalStatus.SEALED.value,
+                        SubGoalStatus.MERGED.value,
+                    ):
+                        has_unsealed_dep = True
+                    elif d_sg.sealed_sha or d_sg.base_sha:
+                        dep_sha = str(d_sg.sealed_sha or d_sg.base_sha)
+                eff_status = str(
+                    body.get("status")
+                    or (SubGoalStatus.LOCKED_DEP.value if has_unsealed_dep else SubGoalStatus.ACTIVE.value)
+                )
+                raw_kind = body.get("kind", SubGoalKind.DIRECTION_TRACK.value)
+                sg_node = SubGoalNode(
+                    subgoal_id=sg_id,
+                    goal_id=goal.goal_id,
+                    title=title,
+                    direction_thesis=thesis,
+                    direct_contribution=contrib,
+                    local_metric=local_metric,
+                    kind=raw_kind if isinstance(raw_kind, SubGoalKind) else SubGoalKind(str(raw_kind)),
+                    status=eff_status,
+                    baseline_value=float(body.get("baseline_value", goal.baseline_value)),
+                    target_value=None if body.get("target_value") is None else float(body["target_value"]),
+                    direction=str(body.get("direction") or goal.direction),
+                    kill_criteria=[str(x) for x in (body.get("kill_criteria") or goal.kill_criteria)],
+                    depends_on_subgoals=deps,
+                    track_branch=str(body.get("track_branch") or f"track/{goal.project}/{sg_id}"),
+                    base_sha=str(body.get("base_sha") or dep_sha or goal.baseline_sha),
+                    compute_target=str(body.get("compute_target") or "cpu_only"),
+                    spec_paths=[str(x) for x in (body.get("spec_paths") or [])],
+                    writable_prefixes=[str(x) for x in (body.get("writable_prefixes") or goal.writable_prefixes)],
+                    priority_weight=float(body.get("priority_weight", 1.0)),
+                    max_tokens_budget=int(body.get("max_tokens_budget", 0)),
+                    max_auto_generations=int(body.get("max_auto_generations", 1)),
+                    wave_gated=bool(body.get("wave_gated", True)),
+                    params=dict(body.get("params") or {}),
+                )
+                stored_sg = self.db.save_subgoal(sg_node, now=now)
+                created_hids: list[str] = []
+                for idx, raw_s in enumerate(body.get("initial_slices") or body.get("proposals") or [], start=1):
+                    if not isinstance(raw_s, Mapping):
+                        continue
+                    s_hid = str(raw_s.get("hypothesis_id") or f"hyp_{uuid.uuid4().hex[:10]}")
+                    s_kind = HypothesisKind(raw_s.get("kind", HypothesisKind.COMPETING_ROUTE.value))
+                    s_wp = [str(p) for p in (raw_s.get("writable_paths") or stored_sg.writable_prefixes or goal.writable_prefixes)]
+                    s_title = str(raw_s.get("title") or f"{stored_sg.title} slice {idx}").strip()
+                    s_mech = str(raw_s.get("mechanism") or s_title).strip()
+                    s_screen = str(raw_s.get("screen_cmd") or "pytest -q")
+                    s_params = {
+                        **dict(raw_s.get("params") or {}),
+                        "subgoal_id": stored_sg.subgoal_id,
+                        "subgoal_local_metric": stored_sg.local_metric,
+                        "subgoal_baseline_value": float(stored_sg.baseline_value),
+                        "subgoal_direction": stored_sg.direction,
+                        "wave_gated": stored_sg.wave_gated,
+                    }
+                    if stored_sg.spec_paths:
+                        s_params.setdefault("spec_paths", list(stored_sg.spec_paths))
+                    s_fp = str(raw_s.get("fingerprint") or "").strip() or compute_hypothesis_fingerprint(
+                        goal_id=goal.goal_id,
+                        kind=s_kind,
+                        mechanism=s_mech,
+                        params=s_params,
+                        writable_paths=s_wp,
+                        screen_cmd=s_screen,
+                    )
+                    h_node = HypothesisNode(
+                        hypothesis_id=s_hid,
+                        goal_id=goal.goal_id,
+                        parent_id=raw_s.get("parent_id"),
+                        kind=s_kind,
+                        title=s_title,
+                        statement=str(raw_s.get("statement") or s_title),
+                        mechanism=s_mech,
+                        fidelity=FidelityRung(raw_s.get("fidelity", FidelityRung.F1_FAST_SCREEN.value)),
+                        priority_evoi=float(raw_s.get("priority_evoi", 1.2)),
+                        writable_paths=s_wp,
+                        params=s_params,
+                        kill_criteria=[str(x) for x in (raw_s.get("kill_criteria") or stored_sg.kill_criteria)],
+                        acceptance_cmd=str(raw_s.get("acceptance_cmd") or s_screen),
+                        screen_cmd=s_screen,
+                        confirm_cmd=raw_s.get("confirm_cmd", s_screen),
+                        branch_name=str(raw_s.get("branch_name") or f"arr/{goal.project}/{s_hid}"),
+                        base_sha=str(raw_s.get("base_sha") or stored_sg.base_sha or goal.baseline_sha),
+                        status="PENDING",
+                        fingerprint=s_fp,
+                        subgoal_id=stored_sg.subgoal_id,
+                    )
+                    reg_h, _ = self.db.register_hypothesis(h_node)
+                    created_hids.append(reg_h.hypothesis_id)
+                all_active = {
+                    t.task_id
+                    for t in self.db.list_tasks(goal_id=goal.goal_id)
+                    if t.status in ACTIVE_TASK_STATUSES
+                }
+                _, before_epoch, after_epoch = self._bump_goal_epoch(
+                    goal, sync_unaffected_task_ids=all_active
+                )
+                return (
+                    {
+                        "goal_id": goal.goal_id,
+                        "subgoal_id": stored_sg.subgoal_id,
+                        "status": stored_sg.status,
+                        "subgoal": stored_sg.to_dict(),
+                        "created_hypothesis_ids": created_hids,
+                    },
+                    before_epoch,
+                    after_epoch,
+                )
+
+            if act == "merge":
+                raw_sources = body.get("source_subgoal_ids") or body.get("sources") or []
+                if isinstance(raw_sources, str):
+                    source_ids = [s.strip() for s in raw_sources.split(",") if s.strip()]
+                else:
+                    source_ids = [str(s).strip() for s in raw_sources if str(s).strip()]
+                if len(source_ids) < 2:
+                    raise ValueError("merge subgoal requires at least 2 source_subgoal_ids")
+                first_sg = self.db.get_subgoal(source_ids[0])
+                eff_gid = goal_id or (first_sg.goal_id if first_sg is not None else None)
+                goal = self._require_goal(eff_gid)
+                src_nodes: list[SubGoalNode] = []
+                merge_shas: list[str] = []
+                for sid in source_ids:
+                    sn = self.db.get_goal_subgoal(goal.goal_id, sid)
+                    if sn is None:
+                        raise KeyError(f"Unknown subgoal_id: {sid}")
+                    src_nodes.append(sn)
+                    sha = str(sn.sealed_sha or "")
+                    if not sha:
+                        for sh in self._subgoal_hypotheses(goal.goal_id, sid):
+                            if sh.head_sha:
+                                sha = str(sh.head_sha)
+                                break
+                    if sha:
+                        merge_shas.append(sha)
+                if not merge_shas:
+                    raise ValueError(
+                        f"merge subgoals {source_ids} requires at least one sealed_sha or head_sha"
+                    )
+                merge_sg_id = str(body.get("subgoal_id") or target_id or f"sg_merge_{uuid.uuid4().hex[:8]}").strip()
+                primary_sha = merge_shas[0]
+                merge_sg = SubGoalNode(
+                    subgoal_id=merge_sg_id,
+                    goal_id=goal.goal_id,
+                    title=str(body.get("title") or f"Integration merge: {', '.join(source_ids)}"),
+                    direction_thesis=str(
+                        body.get("direction_thesis")
+                        or f"Integrate sealed tracks {', '.join(source_ids)} and verify end-to-end metric"
+                    ),
+                    direct_contribution=str(
+                        body.get("direct_contribution")
+                        or f"Unified integration of {', '.join(source_ids)}"
+                    ),
+                    local_metric=str(body.get("local_metric") or goal.primary_metric),
+                    kind=SubGoalKind.INTEGRATION_MERGE,
+                    status=SubGoalStatus.ACTIVE.value,
+                    baseline_value=float(body.get("baseline_value", goal.baseline_value)),
+                    target_value=(
+                        goal.target_value
+                        if body.get("target_value") is None
+                        else float(body["target_value"])
+                    ),
+                    direction=str(body.get("direction") or goal.direction),
+                    kill_criteria=[str(x) for x in (body.get("kill_criteria") or goal.kill_criteria)],
+                    depends_on_subgoals=[],
+                    source_subgoal_ids=source_ids,
+                    track_branch=f"track/{goal.project}/{merge_sg_id}",
+                    base_sha=primary_sha,
+                    writable_prefixes=[str(x) for x in (body.get("writable_prefixes") or goal.writable_prefixes)],
+                    priority_weight=float(body.get("priority_weight", 1.5)),
+                    wave_gated=bool(body.get("wave_gated", True)),
+                    params={"merge_source_shas": merge_shas},
+                )
+                stored_merge = self.db.save_subgoal(merge_sg, now=now)
+                integ_hid: str | None = None
+                if bool(body.get("create_hypothesis", True)):
+                    ihid = str(body.get("hypothesis_id") or f"hyp_merge_{uuid.uuid4().hex[:8]}")
+                    i_wp = list(stored_merge.writable_prefixes or goal.writable_prefixes or ["src/"])
+                    i_cmd = str(body.get("screen_cmd") or "pytest -q")
+                    i_params = {
+                        "merge_source_shas": merge_shas,
+                        "merge_subgoal_ids": source_ids,
+                        "requires_llm_code": True,
+                        "subgoal_id": stored_merge.subgoal_id,
+                    }
+                    i_fp = compute_hypothesis_fingerprint(
+                        goal_id=goal.goal_id,
+                        kind=HypothesisKind.COMPETING_ROUTE,
+                        mechanism=f"integration_merge::{'+'.join(source_ids)}",
+                        params=i_params,
+                        writable_paths=i_wp,
+                        screen_cmd=i_cmd,
+                    )
+                    i_node = HypothesisNode(
+                        hypothesis_id=ihid,
+                        goal_id=goal.goal_id,
+                        parent_id=None,
+                        kind=HypothesisKind.COMPETING_ROUTE,
+                        title=f"Integrate {', '.join(source_ids)}",
+                        statement=stored_merge.direction_thesis,
+                        mechanism=f"integration_merge::{'+'.join(source_ids)}",
+                        fidelity=FidelityRung.F1_FAST_SCREEN,
+                        priority_evoi=1.8,
+                        writable_paths=i_wp,
+                        params=i_params,
+                        kill_criteria=list(stored_merge.kill_criteria),
+                        acceptance_cmd=str(body.get("acceptance_cmd") or i_cmd),
+                        screen_cmd=i_cmd,
+                        confirm_cmd=body.get("confirm_cmd", i_cmd),
+                        branch_name=f"arr/{goal.project}/{ihid}",
+                        base_sha=primary_sha,
+                        status="PENDING",
+                        fingerprint=i_fp,
+                        subgoal_id=stored_merge.subgoal_id,
+                    )
+                    reg_i, _ = self.db.register_hypothesis(i_node)
+                    integ_hid = reg_i.hypothesis_id
+                all_active = {
+                    t.task_id
+                    for t in self.db.list_tasks(goal_id=goal.goal_id)
+                    if t.status in ACTIVE_TASK_STATUSES
+                }
+                _, before_epoch, after_epoch = self._bump_goal_epoch(
+                    goal, sync_unaffected_task_ids=all_active
+                )
+                return (
+                    {
+                        "goal_id": goal.goal_id,
+                        "subgoal_id": stored_merge.subgoal_id,
+                        "source_subgoal_ids": source_ids,
+                        "merge_source_shas": merge_shas,
+                        "status": stored_merge.status,
+                        "integration_hypothesis_id": integ_hid,
+                    },
+                    before_epoch,
+                    after_epoch,
+                )
+
+            raise ValueError(f"Unsupported subgoal intervention action: {act!r}")
 
 
 __all__ = [

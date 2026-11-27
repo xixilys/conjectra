@@ -26,7 +26,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from conjectra.backends import DEFAULT_BACKEND_FOR_POOL
-from conjectra.arbiter import POOL_NORMALIZATION, ResourceArbiter
+from conjectra.arbiter import (
+    POOL_NORMALIZATION,
+    ResourceArbiter,
+    read_cloud_slot_state,
+    read_load1,
+    read_mem_available_mb,
+)
 from conjectra.explore import (
     _build_ai_propose_prompt,
     _extract_primary_metric_value,
@@ -54,11 +60,19 @@ from conjectra.types import (
     ScientificRole,
     ScientificVerdict,
     StageKind,
+    SubGoalKind,
+    SubGoalNode,
+    SubGoalStatus,
 )
 from conjectra.workload_matrix import ensure_eval_table
 
 DEFAULT_COALESCE_WINDOW_S = 12.0
 MAX_DIGEST_BYTES = 4096
+MAX_SUBGOAL_DIGEST_BYTES = 3072
+APEX_TRIGGER_KINDS: frozenset[str] = frozenset(
+    {"APEX_PORTFOLIO_REVIEW", "INITIAL_SUBGOAL_SPLIT"}
+)
+_MINIMIZE_DIRECTIONS: frozenset[str] = frozenset({"min", "minimize", "lower", "down", "reduce"})
 DECISION_INNER_TIMEOUT_S = 180
 DECISION_OUTER_WALL_TIMEOUT_S = 225
 
@@ -202,6 +216,285 @@ def build_goal_digest(
     return digest
 
 
+def build_subgoal_digest(
+    db: StateDB,
+    goal: ResearchGoal,
+    subgoal: SubGoalNode,
+    max_bytes: int = MAX_SUBGOAL_DIGEST_BYTES,
+) -> dict[str, Any]:
+    """Build an isolated `<3KB` digest containing ONLY this SubGoal's thesis, metric, specs, and slices."""
+    sg_hyps = [
+        h
+        for h in db.list_hypotheses(goal_id=goal.goal_id, subgoal_id=subgoal.subgoal_id)
+        if h.subgoal_id == subgoal.subgoal_id
+    ]
+    sg_hids = {h.hypothesis_id for h in sg_hyps}
+    by_id = {h.hypothesis_id: h for h in sg_hyps}
+    latest_rcpt: dict[str, EvidenceReceipt] = {}
+    for r in db.list_receipts(goal_id=goal.goal_id):
+        if r.hypothesis_id in sg_hids:
+            latest_rcpt[r.hypothesis_id] = r
+
+    eff_metric = (subgoal.local_metric or goal.primary_metric or "").strip()
+    slice_lines: list[dict[str, Any]] = []
+    for h in sg_hyps[-10:]:
+        rcpt = latest_rcpt.get(h.hypothesis_id)
+        val = (
+            _extract_primary_metric_value(rcpt.metrics, eff_metric)
+            if rcpt is not None
+            else None
+        )
+        slice_lines.append(
+            {
+                "id": h.hypothesis_id,
+                "parent": h.parent_id,
+                "gen": _hypothesis_generation(h, by_id),
+                "kind": h.kind.value,
+                "status": h.status,
+                "failure_domain": h.failure_domain.value,
+                "verdict": h.scientific_verdict.value,
+                "metric": val,
+                "repairs_used": int(h.budget_state.get("code_repairs_used", 0)),
+                "reason": (rcpt.failure_reason[:120] if rcpt and rcpt.failure_reason else ""),
+            }
+        )
+
+    knowledge = db.list_knowledge_items(goal_id=goal.goal_id, limit=30)
+    lessons = [
+        {
+            "cat": item["category"],
+            "key": item["key"],
+            "summary": item["content"] if isinstance(item["content"], str) else str(item["content"])[:160],
+        }
+        for item in knowledge
+        if item.get("hypothesis_id") in sg_hids
+    ][:6]
+
+    digest: dict[str, Any] = {
+        "goal_id": goal.goal_id,
+        "version": int(goal.version),
+        "human_epoch": int(goal.human_epoch),
+        "plan_epoch": int(getattr(goal, "plan_epoch", 0) or 0),
+        "subgoal_id": subgoal.subgoal_id,
+        "title": subgoal.title[:160],
+        "kind": subgoal.kind.value if hasattr(subgoal.kind, "value") else str(subgoal.kind),
+        "status": subgoal.status,
+        "thesis": subgoal.direction_thesis[:240],
+        "direct_contribution": subgoal.direct_contribution[:160],
+        "local_metric": eff_metric,
+        "direction": subgoal.direction,
+        "baseline_value": float(subgoal.baseline_value),
+        "target_value": subgoal.target_value,
+        "kill_criteria": list(subgoal.kill_criteria[:6]),
+        "spec_paths": list(subgoal.spec_paths[:8]),
+        "base_sha": subgoal.base_sha,
+        "sealed_sha": subgoal.sealed_sha,
+        "max_auto_generations": int(subgoal.max_auto_generations),
+        "slices": slice_lines,
+        "lessons": lessons,
+    }
+
+    def _encoded_len() -> int:
+        return len(json.dumps(digest, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+
+    while _encoded_len() > max_bytes:
+        if digest.get("lessons"):
+            digest["lessons"].pop()
+        elif len(digest.get("slices") or []) > 1:
+            digest["slices"].pop(0)
+        elif digest.get("kill_criteria"):
+            digest["kill_criteria"].pop()
+        elif digest.get("spec_paths"):
+            digest["spec_paths"].pop()
+        elif digest.get("slices") and digest["slices"][0].get("reason"):
+            digest["slices"][0]["reason"] = ""
+        elif len(str(digest.get("thesis") or "")) > 40:
+            digest["thesis"] = str(digest["thesis"])[: len(str(digest["thesis"])) // 2]
+        elif len(str(digest.get("direct_contribution") or "")) > 0:
+            digest["direct_contribution"] = ""
+        elif digest.get("slices"):
+            digest["slices"].pop(0)
+        elif len(str(digest.get("thesis") or "")) > 0:
+            digest["thesis"] = ""
+        elif len(str(digest.get("title") or "")) > 16:
+            digest["title"] = str(digest["title"])[:16]
+        else:
+            dropped = False
+            for opt_key in (
+                "base_sha",
+                "sealed_sha",
+                "max_auto_generations",
+                "plan_epoch",
+                "human_epoch",
+                "version",
+                "target_value",
+                "baseline_value",
+                "direction",
+                "kind",
+                "status",
+            ):
+                if opt_key in digest:
+                    digest.pop(opt_key)
+                    dropped = True
+                    break
+            if not dropped:
+                break
+    return digest
+
+
+def _read_cached_slurm_snapshot(cache_dir: Path | None = None) -> dict[str, Any]:
+    """Read optional cached Slurm state files read-only without blocking or erroring."""
+    base = cache_dir or (Path.home() / ".cache")
+    now_ts = time.time()
+
+    def _read_one(path: Path) -> dict[str, Any]:
+        if not path.is_file():
+            return {"present": False}
+        try:
+            age_s = max(0.0, now_ts - path.stat().st_mtime)
+            raw_text = path.read_text(encoding="utf-8", errors="replace")
+            doc = json.loads(raw_text)
+        except Exception:
+            return {"present": True, "stale": True, "error": "invalid_json"}
+        stale = age_s > 3600.0
+        if isinstance(doc, Mapping):
+            ts_val = doc.get("ts") or doc.get("updated_at")
+            if isinstance(ts_val, (int, float)):
+                stale = max(0.0, now_ts - float(ts_val)) > 3600.0
+            compact = json.dumps(doc, sort_keys=True, ensure_ascii=False)
+            summary: Any = doc if len(compact) <= 1024 else {"keys": sorted(str(k) for k in doc.keys())[:20], "preview": compact[:512]}
+        else:
+            summary = doc if len(str(doc)) <= 512 else str(doc)[:512]
+        return {"present": True, "stale": bool(stale), "data": summary}
+
+    return {
+        "slurm_sinfo": _read_one(base / "slurm_sinfo.json"),
+        "slurm_queue_state": _read_one(base / "slurm_queue_state.json"),
+    }
+
+
+def build_portfolio_sandtable(
+    db: StateDB,
+    goal: ResearchGoal,
+    arbiter: ResourceArbiter | None = None,
+) -> dict[str, Any]:
+    """Build a compact cross-SubGoal comparison table plus 0-token Live Compute Snapshot for ApexDirector."""
+    subgoals = db.list_subgoals(goal_id=goal.goal_id) if hasattr(db, "list_subgoals") else []
+    hyps = db.list_hypotheses(goal_id=goal.goal_id)
+    receipts = db.list_receipts(goal_id=goal.goal_id)
+    tasks = db.list_tasks(goal_id=goal.goal_id) if hasattr(db, "list_tasks") else []
+
+    ledger_task_tokens: dict[str, int] = {}
+    with contextlib.suppress(Exception):
+        with db._lock:
+            rows_tok = db._conn.execute(
+                """
+                SELECT entity_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS tok
+                FROM token_usage_ledger
+                WHERE goal_id = ? AND state = 'SETTLED' AND entity_kind = 'task'
+                GROUP BY entity_id
+                """,
+                (goal.goal_id,),
+            ).fetchall()
+            for row_t in rows_tok:
+                ledger_task_tokens[str(row_t["entity_id"])] = int(row_t["tok"] or 0)
+
+    rcpts_by_hyp: dict[str, list[EvidenceReceipt]] = {}
+    for r in receipts:
+        rcpts_by_hyp.setdefault(r.hypothesis_id, []).append(r)
+
+    tasks_by_hyp: dict[str, list[Any]] = {}
+    for t in tasks:
+        tasks_by_hyp.setdefault(t.hypothesis_id, []).append(t)
+
+    sg_rows: list[dict[str, Any]] = []
+    for sg in subgoals:
+        sg_hyps = [h for h in hyps if getattr(h, "subgoal_id", None) == sg.subgoal_id]
+        eff_metric = (sg.local_metric or goal.primary_metric or "").strip()
+        minimize = (sg.direction or "maximize").strip().lower() in _MINIMIZE_DIRECTIONS
+        best_val: float | None = None
+        rcpt_tok = 0
+        ledger_tok = 0
+        blocker = ""
+
+        for h in sg_hyps:
+            h_rcpts = rcpts_by_hyp.get(h.hypothesis_id, [])
+            for r in h_rcpts:
+                rcpt_tok += int(r.in_tokens) + int(r.out_tokens)
+                val = _extract_primary_metric_value(r.metrics, eff_metric)
+                if val is not None:
+                    if best_val is None or (val < best_val if minimize else val > best_val):
+                        best_val = val
+            for t in tasks_by_hyp.get(h.hypothesis_id, []):
+                ledger_tok += ledger_task_tokens.get(t.task_id, 0)
+
+        if sg.status == SubGoalStatus.LOCKED_DEP.value:
+            blocker = f"waiting_deps:{','.join(sg.depends_on_subgoals)}"
+        else:
+            for h in sg_hyps:
+                if h.status in ("NEEDS_REPAIR", "BLOCKED_ENV", "BLOCKED_INFRA", "BLOCKED_TIMEOUT", "BLOCKED_REPAIR_BUDGET", "ESCALATED", "REFUTED"):
+                    h_rcpts = rcpts_by_hyp.get(h.hypothesis_id, [])
+                    last_r = h_rcpts[-1] if h_rcpts else None
+                    reason_tail = (last_r.failure_reason[:80] if last_r and last_r.failure_reason else "")
+                    blocker = f"{h.hypothesis_id}:{h.status}" + (f":{reason_tail}" if reason_tail else "")
+                    break
+            if not blocker and sg.status == SubGoalStatus.AWAITING_APEX.value:
+                blocker = "awaiting_apex_review"
+
+        sg_rows.append(
+            {
+                "subgoal_id": sg.subgoal_id,
+                "title": sg.title[:80],
+                "kind": sg.kind.value if hasattr(sg.kind, "value") else str(sg.kind),
+                "status": sg.status,
+                "local_metric": eff_metric,
+                "direction": sg.direction,
+                "baseline_value": float(sg.baseline_value),
+                "best_metric": best_val,
+                "target_value": sg.target_value,
+                "sealed_sha": sg.sealed_sha,
+                "base_sha": sg.base_sha,
+                "depends_on_subgoals": list(sg.depends_on_subgoals),
+                "source_subgoal_ids": list(sg.source_subgoal_ids),
+                "priority_weight": float(sg.priority_weight),
+                "max_tokens_budget": int(sg.max_tokens_budget),
+                "token_spend": max(rcpt_tok, ledger_tok),
+                "hypotheses_count": len(sg_hyps),
+                "blocker": blocker[:120],
+            }
+        )
+
+    cloud_paths = getattr(arbiter, "cloud_slot_search_paths", None) if arbiter is not None else None
+    cloud_state = read_cloud_slot_state(cloud_paths)
+    compute_snapshot: dict[str, Any] = {
+        "cloud": {
+            "available_slots": int(cloud_state.available_slots),
+            "active_jobs": int(cloud_state.active_jobs),
+            "status": str(cloud_state.status),
+            "stale": bool(cloud_state.stale),
+        },
+        "local": {
+            "mem_available_mb": read_mem_available_mb(),
+            "load1": read_load1(),
+            "cpus": os.cpu_count() or 1,
+        },
+        "slurm": _read_cached_slurm_snapshot(),
+    }
+
+    return {
+        "goal_id": goal.goal_id,
+        "goal_title": goal.title[:120],
+        "primary_metric": goal.primary_metric,
+        "direction": goal.direction,
+        "baseline_value": float(goal.baseline_value),
+        "target_value": goal.target_value,
+        "version": int(goal.version),
+        "plan_epoch": int(getattr(goal, "plan_epoch", 0) or 0),
+        "subgoals": sg_rows,
+        "compute_snapshot": compute_snapshot,
+    }
+
+
 def parse_lead_decision_payload(
     raw_text: str,
     *,
@@ -256,6 +549,7 @@ def parse_lead_decision_payload(
                 uncertainty_id=cand.get("uncertainty_id"),
                 rationale=str(cand.get("statement") or cand.get("title") or ""),
                 parameters={"proposal": dict(cand)},
+                target_subgoal_id=cand.get("subgoal_id"),
             )
         )
     return LeadDecisionEnvelope(
@@ -500,12 +794,13 @@ class DecisionEngine:
         urgency: str = "COALESCED",
         coalesce_window_s: float = DEFAULT_COALESCE_WINDOW_S,
         hypothesis_id: str | None = None,
+        subgoal_id: str | None = None,
         head_sha: str = "",
         failure_domain: FailureDomain | str | None = None,
         payload: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
-        """Enqueue a role-typed per-Goal or per-Hypothesis decision request with budget & coalesce guards."""
+        """Enqueue a role-typed per-Goal, per-SubGoal, or per-Hypothesis decision request with budget & coalesce guards."""
         goal = self.db.get_goal(goal_id)
         if goal is None:
             raise KeyError(f"Unknown goal_id: {goal_id}")
@@ -517,7 +812,8 @@ class DecisionEngine:
         if role is None and t_norm not in ("L0", "L1", "L2"):
             raise ValueError(f"Invalid decision tier {tier!r}; expected L0|L1|L2")
 
-        routine_trigger = str(trigger_kind or "").strip().upper() in (
+        trig_upper = str(trigger_kind or "").strip().upper()
+        routine_trigger = trig_upper in (
             "EVIDENCE_UPDATE",
             "INITIAL_PLANNING",
             "BRANCH_CONVERGENCE",
@@ -541,6 +837,9 @@ class DecisionEngine:
                 if eff_role == ScientificRole.RESEARCH_DIRECTOR
                 else ("L0" if t_norm == "L0" else "L1")
             )
+        elif trig_upper in APEX_TRIGGER_KINDS:
+            eff_role = ScientificRole.RESEARCH_DIRECTOR
+            eff_tier = "L2"
         else:
             eff_tier = t_norm
             eff_role = (
@@ -551,6 +850,19 @@ class DecisionEngine:
 
         hyp: HypothesisNode | None = (
             self.db.get_hypothesis(hypothesis_id) if hypothesis_id else None
+        )
+        eff_sg_id = (
+            str(subgoal_id).strip()
+            if subgoal_id is not None and str(subgoal_id).strip()
+            else (
+                str(req_payload_map["subgoal_id"]).strip()
+                if req_payload_map.get("subgoal_id") and str(req_payload_map["subgoal_id"]).strip()
+                else (
+                    str(hyp.subgoal_id).strip()
+                    if hyp is not None and getattr(hyp, "subgoal_id", None)
+                    else None
+                )
+            )
         )
         eff_window = 0.0 if urg == "IMMEDIATE" else max(0.0, float(coalesce_window_s))
         fdom_str = (
@@ -565,19 +877,43 @@ class DecisionEngine:
             coalesce_key = f"{goal_id}:{hypothesis_id}:{eff_sha}:{fdom_str}"
         elif urg == "IMMEDIATE":
             coalesce_key = ""
+        elif eff_sg_id:
+            coalesce_key = f"{goal_id}:{eff_role.value}:{trigger_kind}:{eff_sg_id}"
         else:
             coalesce_key = f"{goal_id}:{eff_role.value}:{trigger_kind}"
 
-        digest = build_goal_digest(self.db, goal)
+        sg_obj: SubGoalNode | None = None
+        if eff_sg_id:
+            if hasattr(self.db, "get_goal_subgoal"):
+                sg_obj = self.db.get_goal_subgoal(goal_id, eff_sg_id)
+            elif hasattr(self.db, "get_subgoal"):
+                cand_sg = self.db.get_subgoal(eff_sg_id)
+                sg_obj = cand_sg if (cand_sg is not None and cand_sg.goal_id == goal_id) else None
+
+        if eff_role == ScientificRole.RESEARCH_LEAD and sg_obj is not None:
+            digest = build_subgoal_digest(self.db, goal, sg_obj)
+        else:
+            digest = build_goal_digest(self.db, goal)
+
         req_payload: dict[str, Any] = {
             "role": eff_role.value,
             "urgency": urg,
             "digest": digest,
             "attempt": 1,
-            **dict(payload or {}),
+            **req_payload_map,
         }
         if hypothesis_id:
             req_payload["hypothesis_id"] = hypothesis_id
+        if eff_sg_id:
+            req_payload["subgoal_id"] = eff_sg_id
+        if eff_role == ScientificRole.RESEARCH_DIRECTOR and (
+            trig_upper in APEX_TRIGGER_KINDS
+            or (hasattr(self.db, "list_subgoals") and bool(self.db.list_subgoals(goal_id=goal_id)))
+        ):
+            req_payload.setdefault(
+                "portfolio_sandtable",
+                build_portfolio_sandtable(self.db, goal, arbiter=self.arbiter),
+            )
 
         with self.db._tx() as (conn, _pending):
             existing_pending = None
@@ -629,6 +965,7 @@ class DecisionEngine:
             coalesce_key=coalesce_key,
             coalesce_window_s=eff_window,
             payload=req_payload,
+            subgoal_id=eff_sg_id,
             now=now,
         )
 
@@ -664,8 +1001,15 @@ class DecisionEngine:
 
         role_str = str(req.get("role") or ScientificRole.RESEARCH_LEAD.value)
         wf_id_submit = str(req_payload.get("workflow_id") or "").strip() or None
+        excl_specs = [
+            str(s).strip() for s in (req_payload.get("exclude_specs") or []) if str(s).strip()
+        ]
         route = self.resolve_route_for_role(
-            role_str, goal=goal, hyp=hyp, workflow_id=wf_id_submit
+            role_str,
+            goal=goal,
+            hyp=hyp,
+            workflow_id=wf_id_submit,
+            exclude_specs=excl_specs,
         )
 
         submit_nonce = uuid.uuid4().hex[:12]
@@ -1091,6 +1435,10 @@ class DecisionEngine:
         receipts: Sequence[EvidenceReceipt],
     ) -> str:
         role_val = str(req.get("role") or ScientificRole.RESEARCH_LEAD.value)
+        req_pl = dict(req.get("payload") or {})
+        sg_id = str(req.get("subgoal_id") or req_pl.get("subgoal_id") or "").strip() or None
+        trig_upper = str(req.get("trigger_kind") or "").strip().upper()
+
         gy_fps = {
             str(g["fingerprint"])
             for g in self.db.list_graveyard(goal_id=goal.goal_id)
@@ -1098,6 +1446,66 @@ class DecisionEngine:
         }
         gy_entries = self.db.list_graveyard(goal_id=goal.goal_id)
         knowledge = self.db.list_knowledge_items(goal_id=goal.goal_id, limit=25)
+
+        if role_val == ScientificRole.RESEARCH_LEAD.value and sg_id:
+            sg_obj = (
+                self.db.get_goal_subgoal(goal.goal_id, sg_id)
+                if hasattr(self.db, "get_goal_subgoal")
+                else (self.db.get_subgoal(sg_id) if hasattr(self.db, "get_subgoal") else None)
+            )
+            sg_hyps = [h for h in hyps if getattr(h, "subgoal_id", None) == sg_id]
+            sg_hids = {h.hypothesis_id for h in sg_hyps}
+            sg_receipts = [r for r in receipts if r.hypothesis_id in sg_hids]
+            sg_knowledge = [k for k in knowledge if k.get("hypothesis_id") in sg_hids]
+            base_prompt = _build_ai_propose_prompt(
+                goal,
+                sg_hyps,
+                gy_fps,
+                max_proposals=3,
+                receipts=sg_receipts,
+                graveyard_entries=gy_entries,
+                knowledge_items=sg_knowledge,
+                include_output_instructions=False,
+            )
+            digest = req_pl.get("digest") or (
+                build_subgoal_digest(self.db, goal, sg_obj)
+                if sg_obj is not None
+                else build_goal_digest(self.db, goal)
+            )
+            track_actions = [
+                a.value
+                for a in ActionKind
+                if a
+                not in (
+                    ActionKind.SPAWN_SUBGOAL,
+                    ActionKind.RETUNE_SUBGOAL,
+                    ActionKind.MERGE_SUBGOALS,
+                    ActionKind.KILL_AND_REALLOCATE,
+                    ActionKind.SYNC_SUBGOAL_BASE,
+                )
+            ]
+            local_metric_str = (
+                f"{sg_obj.local_metric} (direction={sg_obj.direction}, baseline={sg_obj.baseline_value}, target={sg_obj.target_value})"
+                if sg_obj is not None
+                else goal.primary_metric
+            )
+            return (
+                f"ROLE: TrackLead ({role_val}) scoped strictly to SubGoal [{sg_id}]\n"
+                f"TRIGGER: {req.get('trigger_kind')} | SubGoal Local Metric: {local_metric_str}\n"
+                f"Isolated SubGoal Digest (<3KB): {json.dumps(digest)}\n"
+                "Task: Advance or repair slices strictly within this single SubGoal.\n"
+                "ISOLATION RULES:\n"
+                f"- You are STRICTLY scoped to subgoal_id={sg_id!r}. You are FORBIDDEN from mutating, pruning, or retuning sibling SubGoals.\n"
+                "- When this SubGoal is blocked (generation cap reached, repair budget exhausted, missing dependency) or its local target is reached, emit `REQUEST_DIRECTOR_ADJUDICATION` to escalate to ApexDirector.\n"
+                "IMPORTANT: Ground every action in measured F1/F2 metrics, failure_domain, and existing repository paths.\n"
+                "Do NOT spawn new hypotheses to work around ENGINEERING_DEFECT or ENV_CONFIG_MISMATCH — emit `REPAIR_IMPLEMENTATION` or `REVISE_HYPOTHESIS` instead!\n"
+                f"Return STRICT JSON ONLY (no prose) matching schema: {{\"role\": {role_val!r}, \"uncertainty_summary\": \"...\", "
+                f"\"actions\": [{{\"action\": one of {track_actions}, \"target_hypothesis_id\": \"...\", \"target_subgoal_id\": {sg_id!r}, "
+                "\"uncertainty_id\": \"...\", \"rationale\": \"...\", \"parameters\": {...}}]}.\n"
+                + "\n"
+                + base_prompt
+            )
+
         base_prompt = _build_ai_propose_prompt(
             goal,
             hyps,
@@ -1106,18 +1514,47 @@ class DecisionEngine:
             receipts=receipts,
             graveyard_entries=gy_entries,
             knowledge_items=knowledge,
+            include_output_instructions=False,
         )
-        digest = (req.get("payload") or {}).get("digest") or build_goal_digest(self.db, goal)
+        digest = req_pl.get("digest") or build_goal_digest(self.db, goal)
         allowed_actions = [a.value for a in ActionKind]
         grounding_note = (
             "IMPORTANT: Ground every action in measured F1/F2 metrics, failure_domain, and existing repository paths.\n"
             "Do NOT spawn new hypotheses to work around ENGINEERING_DEFECT or ENV_CONFIG_MISMATCH — emit "
             "`REPAIR_IMPLEMENTATION` or `REVISE_HYPOTHESIS` instead!\n"
-            f"Preferred JSON schema: {{\"role\": {role_val!r}, \"uncertainty_summary\": \"...\", "
-            f"\"actions\": [{{\"action\": one of {allowed_actions}, \"target_hypothesis_id\": \"...\", "
+            "LATENCY BUDGET: Decide primarily from the Compact Digest, hypothesis lineage, and recent receipts; "
+            "perform at most 1-2 targeted file reads if strictly necessary, and finish within 60-90s (hard cap 180s).\n"
+            "NEVER return an empty actions list (`actions: []` or `[]`) when active hypotheses are in "
+            "NEEDS_REPAIR/BLOCKED_* or when ready tasks are empty — emit concrete actions to repair, revise, prune, "
+            "escalate to director, or propose a grounded competing route.\n"
+            f"Return STRICT JSON ONLY (no prose) matching schema: {{\"role\": {role_val!r}, \"uncertainty_summary\": \"...\", "
+            f"\"actions\": [{{\"action\": one of {allowed_actions}, \"target_hypothesis_id\": \"...\", \"target_subgoal_id\": \"...\", "
             "\"uncertainty_id\": \"...\", \"rationale\": \"...\", \"parameters\": {...}}}]}.\n"
+            "For PROPOSE_COMPETING_ROUTE, parameters.proposal MUST include: kind, parent_id, title, statement, "
+            "mechanism, writable_paths, params, kill_criteria, screen_cmd, confirm_cmd, acceptance_cmd.\n"
         )
         if role_val == ScientificRole.RESEARCH_DIRECTOR.value:
+            is_apex = trig_upper in APEX_TRIGGER_KINDS or "portfolio_sandtable" in req_pl
+            if is_apex:
+                sandtable = req_pl.get("portfolio_sandtable") or build_portfolio_sandtable(
+                    self.db, goal, arbiter=self.arbiter
+                )
+                return (
+                    "ROLE: ApexDirector (Research Director — Multi-SubGoal Portfolio & Compute Allocator)\n"
+                    f"TRIGGER: {req.get('trigger_kind')}\n"
+                    f"Portfolio Sandtable & 0-Token Live Compute Snapshot: {json.dumps(sandtable)}\n"
+                    f"Compact Digest (<4KB): {json.dumps(digest)}\n"
+                    "Portfolio Actions:\n"
+                    "- `SPAWN_SUBGOAL`: requires non-empty `title`, `direction_thesis`, substantive `direct_contribution` (NO pure doc/hash bookkeeping filler), `local_metric`, optional `depends_on_subgoals`, `initial_slices`.\n"
+                    "- `MERGE_SUBGOALS`: `source_subgoal_ids` (>=2 tracks with `sealed_sha`/`head_sha`) -> creates `INTEGRATION_MERGE` SubGoal & isolated merge slice.\n"
+                    "- `RETUNE_SUBGOAL`: update `local_metric`/`target_value`/`baseline_value`/`direction`/`kill_criteria`/`compute_target`/`priority_weight`/`max_tokens_budget` on `target_subgoal_id`.\n"
+                    "- `KILL_AND_REALLOCATE`: kill stalled/redundant `target_subgoal_id` and reallocate weight/budget to `reallocate_to` or active siblings.\n"
+                    "- `SYNC_SUBGOAL_BASE`: sync `target_subgoal_id` `base_sha` to `upstream_subgoal_id.sealed_sha` (or `sha`) and unlock `LOCKED_DEP -> ACTIVE`.\n"
+                    "- `REQUEST_OWNER_DECISION`: escalate major scope/budget/goal-bar changes to the human owner.\n"
+                    + grounding_note
+                    + "\n"
+                    + base_prompt
+                )
             return (
                 "ROLE: Research Director (Strategic Adjudicator & Tie-Breaker)\n"
                 f"TRIGGER: {req.get('trigger_kind')} | Compact Digest (<4KB): {json.dumps(digest)}\n"
@@ -1142,17 +1579,146 @@ class DecisionEngine:
         goal: ResearchGoal,
         hyps: Sequence[HypothesisNode],
         role: ScientificRole,
+        *,
+        trigger_kind: str = "",
+        subgoal_id: str | None = None,
+        subgoals: Sequence[SubGoalNode] = (),
     ) -> LeadDecisionEnvelope:
         """Offline test-only envelope (`--dry-run-llm` ONLY; never called in live execution)."""
-        by_id = {h.hypothesis_id: h for h in hyps}
-        max_gen = max((_hypothesis_generation(h, by_id) for h in hyps), default=1)
-        next_gen = max(3 if role == ScientificRole.RESEARCH_DIRECTOR else 2, max_gen + 1)
+        trig_upper = str(trigger_kind or "").strip().upper()
+        if role == ScientificRole.RESEARCH_DIRECTOR and trig_upper in APEX_TRIGGER_KINDS:
+            sealed_sgs = [s for s in subgoals if s.sealed_sha or s.status == SubGoalStatus.SEALED.value]
+            locked_ready = [
+                s
+                for s in subgoals
+                if s.status == SubGoalStatus.LOCKED_DEP.value
+                and s.depends_on_subgoals
+                and all(
+                    any(u.subgoal_id == dep and u.status == SubGoalStatus.SEALED.value and u.sealed_sha for u in subgoals)
+                    for dep in s.depends_on_subgoals
+                )
+            ]
+            awaiting_sgs = [s for s in subgoals if s.status == SubGoalStatus.AWAITING_APEX.value]
+            if trig_upper != "INITIAL_SUBGOAL_SPLIT" and len(sealed_sgs) >= 2:
+                return LeadDecisionEnvelope(
+                    role=role,
+                    goal_id=goal.goal_id,
+                    goal_version=int(goal.version),
+                    human_epoch=int(goal.human_epoch),
+                    uncertainty_summary="dry_run_llm apex integration merge",
+                    actions=[
+                        LeadAction(
+                            action=ActionKind.MERGE_SUBGOALS,
+                            rationale="dry_run_llm merge sealed tracks",
+                            parameters={"source_subgoal_ids": [sealed_sgs[0].subgoal_id, sealed_sgs[1].subgoal_id]},
+                        )
+                    ],
+                )
+            if trig_upper != "INITIAL_SUBGOAL_SPLIT" and locked_ready:
+                tgt = locked_ready[0]
+                return LeadDecisionEnvelope(
+                    role=role,
+                    goal_id=goal.goal_id,
+                    goal_version=int(goal.version),
+                    human_epoch=int(goal.human_epoch),
+                    uncertainty_summary="dry_run_llm apex sync locked subgoal base",
+                    actions=[
+                        LeadAction(
+                            action=ActionKind.SYNC_SUBGOAL_BASE,
+                            target_subgoal_id=tgt.subgoal_id,
+                            rationale="dry_run_llm sync sealed upstream base",
+                            parameters={"upstream_subgoal_id": tgt.depends_on_subgoals[-1]},
+                        )
+                    ],
+                )
+            if trig_upper != "INITIAL_SUBGOAL_SPLIT" and awaiting_sgs:
+                tgt = awaiting_sgs[0]
+                return LeadDecisionEnvelope(
+                    role=role,
+                    goal_id=goal.goal_id,
+                    goal_version=int(goal.version),
+                    human_epoch=int(goal.human_epoch),
+                    uncertainty_summary="dry_run_llm apex retune stalled subgoal",
+                    actions=[
+                        LeadAction(
+                            action=ActionKind.RETUNE_SUBGOAL,
+                            target_subgoal_id=tgt.subgoal_id,
+                            rationale="dry_run_llm retune stalled track",
+                            parameters={"priority_weight": max(1.0, float(tgt.priority_weight))},
+                        )
+                    ],
+                )
+            sg_idx = len(subgoals) + 1
+            return LeadDecisionEnvelope(
+                role=role,
+                goal_id=goal.goal_id,
+                goal_version=int(goal.version),
+                human_epoch=int(goal.human_epoch),
+                uncertainty_summary="dry_run_llm apex spawn subgoal",
+                actions=[
+                    LeadAction(
+                        action=ActionKind.SPAWN_SUBGOAL,
+                        rationale="dry_run_llm spawn direction track",
+                        parameters={
+                            "subgoal_id": f"{goal.goal_id}-sg{sg_idx}",
+                            "title": f"Dry-run direction track #{sg_idx}",
+                            "direction_thesis": f"Explore orthogonal mechanism #{sg_idx} to improve {goal.primary_metric}.",
+                            "direct_contribution": f"Implement and verify algorithmic slice #{sg_idx} on {goal.primary_metric}.",
+                            "local_metric": goal.primary_metric or "tests_passed",
+                            "kind": SubGoalKind.DIRECTION_TRACK.value,
+                            "baseline_value": float(goal.baseline_value),
+                            "direction": goal.direction,
+                        },
+                    )
+                ],
+            )
+
+        scoped_hyps = (
+            [h for h in hyps if getattr(h, "subgoal_id", None) == subgoal_id]
+            if (role == ScientificRole.RESEARCH_LEAD and subgoal_id)
+            else list(hyps)
+        )
+        by_id = {h.hypothesis_id: h for h in scoped_hyps}
+        max_gen = max((_hypothesis_generation(h, by_id) for h in scoped_hyps), default=0)
+        if role == ScientificRole.RESEARCH_LEAD and subgoal_id:
+            sg_match = next((s for s in subgoals if s.subgoal_id == subgoal_id), None)
+            max_auto = int(getattr(sg_match, "max_auto_generations", 1) if sg_match is not None else 1)
+            if scoped_hyps and max_gen >= max_auto:
+                return LeadDecisionEnvelope(
+                    role=role,
+                    goal_id=goal.goal_id,
+                    goal_version=int(goal.version),
+                    human_epoch=int(goal.human_epoch),
+                    uncertainty_summary="dry_run_llm track lead escalation",
+                    actions=[
+                        LeadAction(
+                            action=ActionKind.REQUEST_DIRECTOR_ADJUDICATION,
+                            target_hypothesis_id=scoped_hyps[-1].hypothesis_id,
+                            target_subgoal_id=subgoal_id,
+                            rationale="dry_run_llm TrackLead reached subgoal generation cap",
+                        )
+                    ],
+                    metadata={"subgoal_id": subgoal_id},
+                )
+
+        next_gen = (
+            max(1, max_gen + 1)
+            if (role == ScientificRole.RESEARCH_LEAD and subgoal_id)
+            else max(3 if role == ScientificRole.RESEARCH_DIRECTOR else 2, max_gen + 1)
+        )
         parent = next(
-            (h for h in hyps if h.scientific_verdict == ScientificVerdict.CONFIRMED),
-            hyps[0] if hyps else None,
+            (h for h in scoped_hyps if h.scientific_verdict == ScientificVerdict.CONFIRMED),
+            scoped_hyps[0] if scoped_hyps else None,
         )
         wp = list(parent.writable_paths) if parent else (list(goal.writable_prefixes) or ["src/"])
-        prop = {
+        prop_params: dict[str, Any] = {
+            "generation": next_gen,
+            "deterministic_no_llm": True,
+            "estimated_tokens": 2500,
+        }
+        if subgoal_id:
+            prop_params["subgoal_id"] = subgoal_id
+        prop: dict[str, Any] = {
             "kind": (
                 HypothesisKind.FALSIFICATION.value
                 if role == ScientificRole.RESEARCH_DIRECTOR
@@ -1163,16 +1729,14 @@ class DecisionEngine:
             "statement": f"Offline dry-run probe on {goal.primary_metric}.",
             "mechanism": f"{role.value}_dryrun_gen{next_gen}",
             "writable_paths": wp,
-            "params": {
-                "generation": next_gen,
-                "deterministic_no_llm": True,
-                "estimated_tokens": 2500,
-            },
+            "params": prop_params,
             "kill_criteria": list(goal.kill_criteria) or [f"{goal.primary_metric} < 0"],
             "screen_cmd": parent.screen_cmd if parent else "python3 -c 'print(1)'",
             "confirm_cmd": parent.confirm_cmd if parent else "python3 -c 'print(1)'",
             "acceptance_cmd": parent.acceptance_cmd if parent else "python3 -c 'print(1)'",
         }
+        if subgoal_id:
+            prop["subgoal_id"] = subgoal_id
         return LeadDecisionEnvelope(
             role=role,
             goal_id=goal.goal_id,
@@ -1183,10 +1747,12 @@ class DecisionEngine:
                 LeadAction(
                     action=ActionKind.PROPOSE_COMPETING_ROUTE,
                     target_hypothesis_id=parent.hypothesis_id if parent else None,
+                    target_subgoal_id=subgoal_id,
                     rationale="dry_run_llm",
                     parameters={"proposal": prop},
                 )
             ],
+            metadata={"subgoal_id": subgoal_id} if subgoal_id else {},
         )
 
     def process_request(
@@ -1318,9 +1884,37 @@ class DecisionEngine:
                 )
             if st_exec == "PENDING":
                 self.db.resolve_decision_request(req_id, status="RUNNING", now=now_exec)
+            if st_exec in ("SUBMITTING", "RUNNING") and hasattr(self.db, "renew_lease"):
+                renewed = self.db.renew_lease(
+                    eff_lease_id,
+                    ttl_s=float(DECISION_OUTER_WALL_TIMEOUT_S + 30),
+                    now=now_exec,
+                )
+                if renewed is None:
+                    raise FencedStaleWriteError(
+                        f"DecisionRequest {req_id} lease {eff_lease_id!r} expired before execution",
+                        reason_code="LEASE_MISMATCH",
+                    )
 
-        hyps = self.db.list_hypotheses(goal_id=goal.goal_id)
-        receipts = self.db.list_receipts(goal_id=goal.goal_id)
+        subgoal_id_exec = (
+            str(req.get("subgoal_id") or payload_dict.get("subgoal_id") or "").strip() or None
+        )
+        subgoals_list = (
+            self.db.list_subgoals(goal_id=goal.goal_id)
+            if hasattr(self.db, "list_subgoals")
+            else []
+        )
+        if role_enum == ScientificRole.RESEARCH_LEAD and subgoal_id_exec:
+            hyps = self.db.list_hypotheses(goal_id=goal.goal_id, subgoal_id=subgoal_id_exec)
+            sg_hids_exec = {h.hypothesis_id for h in hyps}
+            receipts = [
+                r
+                for r in self.db.list_receipts(goal_id=goal.goal_id)
+                if r.hypothesis_id in sg_hids_exec
+            ]
+        else:
+            hyps = self.db.list_hypotheses(goal_id=goal.goal_id)
+            receipts = self.db.list_receipts(goal_id=goal.goal_id)
         prompt = self._build_role_prompt(req, goal, hyps, receipts)
 
         in_tok = 0
@@ -1331,7 +1925,14 @@ class DecisionEngine:
         try:
             if dry_run_llm:
                 model_used = "dry_run_llm"
-                envelope = self._offline_dry_run_envelope(goal, hyps, role_enum)
+                envelope = self._offline_dry_run_envelope(
+                    goal,
+                    hyps,
+                    role_enum,
+                    trigger_kind=str(req.get("trigger_kind") or ""),
+                    subgoal_id=subgoal_id_exec,
+                    subgoals=subgoals_list,
+                )
             else:
                 raw_pinned = payload_dict.get("pinned_route")
                 fresh_goal_exec = self.db.get_goal(goal.goal_id) or goal
@@ -1554,11 +2155,17 @@ class DecisionEngine:
                                 self.db.release_lease(eff_lease_id, now=now_rv)
                             return blocked_res_rv
                 else:
+                    excl_specs_exec = [
+                        str(s).strip()
+                        for s in (payload_dict.get("exclude_specs") or [])
+                        if str(s).strip()
+                    ]
                     route = self.resolve_route_for_role(
                         role_enum,
                         goal=fresh_goal_exec,
                         hyp=fresh_hyp_exec,
                         workflow_id=wf_id_exec,
+                        exclude_specs=excl_specs_exec,
                     )
                 if hasattr(self.db, "reserve_goal_budget"):
                     res_tok = (
@@ -1601,9 +2208,10 @@ class DecisionEngine:
                 if llm_caller is not None:
                     res = llm_caller(prov, prompt)
                 else:
+                    repo_cand = Path(goal.repo_path).expanduser() if goal.repo_path else None
                     cwd_path = (
-                        Path(goal.repo_path)
-                        if Path(goal.repo_path).is_dir()
+                        repo_cand
+                        if (repo_cand is not None and repo_cand.is_dir())
                         else self.db.arr_home
                     )
                     # Single-attempt (`<=1` CLI process invocation per HQ job, 180s cap)
@@ -1693,6 +2301,11 @@ class DecisionEngine:
                     envelope,
                     workflow_runtime=self.workflow_runtime,
                     source=f"decision_{role_enum.value}",
+                    scoped_subgoal_id=(
+                        subgoal_id_exec
+                        if role_enum == ScientificRole.RESEARCH_LEAD and subgoal_id_exec
+                        else None
+                    ),
                 )
                 self.db.upsert_knowledge_item(
                     latest_goal.goal_id,
@@ -1702,6 +2315,7 @@ class DecisionEngine:
                         "req_id": req_id,
                         "role": role_enum.value,
                         "tier": tier,
+                        "subgoal_id": subgoal_id_exec,
                         "trigger_kind": req.get("trigger_kind"),
                         "model_used": model_used,
                         "used_fallback": bool(dry_run_llm),
@@ -1716,6 +2330,7 @@ class DecisionEngine:
                 res_payload = {
                     "role": role_enum.value,
                     "tier": tier,
+                    "subgoal_id": subgoal_id_exec,
                     "model_used": model_used,
                     "used_fallback": bool(dry_run_llm),
                     "in_tokens": in_tok,

@@ -31,6 +31,8 @@ from conjectra.types import (
     ScientificVerdict,
     StageKind,
     StageTask,
+    SubGoalNode,
+    SubGoalStatus,
     WorkflowNode,
 )
 
@@ -314,7 +316,7 @@ class StateDB:
     def _init_schema(self) -> None:
         with self._lock:
             ver_row = self._conn.execute("PRAGMA user_version").fetchone()
-            if ver_row is not None and int(ver_row[0]) >= 8:
+            if ver_row is not None and int(ver_row[0]) >= 9:
                 has_goals = self._conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'goals'"
                 ).fetchone()
@@ -551,6 +553,7 @@ class StateDB:
             self._migrate_v6_schema()
             self._migrate_v7_schema()
             self._migrate_v8_schema()
+            self._migrate_v9_schema()
         self._respawn_migrated_s3_workflows()
 
     def _migrate_v3_schema(self) -> None:
@@ -1359,6 +1362,115 @@ class StateDB:
                     self._conn.execute("ROLLBACK")
                 raise
 
+    def _migrate_v9_schema(self) -> None:
+        """Cross-process atomic `BEGIN IMMEDIATE` WAL schema upgrade to `user_version = 9`.
+
+        Creates `subgoals` table and adds `subgoal_id` columns/indexes to `hypotheses`
+        and `decision_requests` with idempotent backfill from `payload_json`.
+        """
+        with self._lock:
+            fast_ver = self._conn.execute("PRAGMA user_version").fetchone()
+            if fast_ver is not None and int(fast_ver[0]) >= 9:
+                return
+            self._conn.execute("PRAGMA busy_timeout=30000")
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                ver_row = self._conn.execute("PRAGMA user_version").fetchone()
+                user_version = int(ver_row[0]) if ver_row is not None else 0
+                if user_version >= 9:
+                    self._conn.execute("COMMIT")
+                    return
+
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subgoals (
+                        subgoal_id TEXT PRIMARY KEY,
+                        goal_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        priority_weight REAL NOT NULL DEFAULT 1.0,
+                        base_sha TEXT NOT NULL DEFAULT '',
+                        sealed_sha TEXT,
+                        payload_json TEXT NOT NULL,
+                        created_ts REAL NOT NULL,
+                        updated_ts REAL NOT NULL
+                    )
+                    """
+                )
+                self._conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_subgoals_goal_status
+                        ON subgoals (goal_id, status)
+                    """
+                )
+
+                hyp_cols = {
+                    str(r[1])
+                    for r in self._conn.execute("PRAGMA table_info(hypotheses)").fetchall()
+                }
+                if hyp_cols and "subgoal_id" not in hyp_cols:
+                    self._conn.execute(
+                        "ALTER TABLE hypotheses ADD COLUMN subgoal_id TEXT"
+                    )
+                self._conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_hypotheses_goal_subgoal
+                        ON hypotheses (goal_id, subgoal_id)
+                    """
+                )
+
+                dreq_cols = {
+                    str(r[1])
+                    for r in self._conn.execute("PRAGMA table_info(decision_requests)").fetchall()
+                }
+                if dreq_cols and "subgoal_id" not in dreq_cols:
+                    self._conn.execute(
+                        "ALTER TABLE decision_requests ADD COLUMN subgoal_id TEXT"
+                    )
+                self._conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_decision_requests_goal_subgoal
+                        ON decision_requests (goal_id, subgoal_id)
+                    """
+                )
+
+                hyp_rows = self._conn.execute(
+                    "SELECT hypothesis_id, payload_json FROM hypotheses WHERE subgoal_id IS NULL"
+                ).fetchall()
+                for hr in hyp_rows:
+                    pdoc = {}
+                    with contextlib.suppress(ValueError, TypeError):
+                        pdoc = json.loads(hr["payload_json"] or "{}")
+                    sg = pdoc.get("subgoal_id")
+                    if not sg and isinstance(pdoc.get("params"), Mapping):
+                        sg = pdoc["params"].get("subgoal_id")
+                    if sg:
+                        self._conn.execute(
+                            "UPDATE hypotheses SET subgoal_id = ? WHERE hypothesis_id = ? AND subgoal_id IS NULL",
+                            (str(sg), str(hr["hypothesis_id"])),
+                        )
+
+                dreq_rows = self._conn.execute(
+                    "SELECT req_id, payload_json FROM decision_requests WHERE subgoal_id IS NULL"
+                ).fetchall()
+                for dr in dreq_rows:
+                    pdoc = {}
+                    with contextlib.suppress(ValueError, TypeError):
+                        pdoc = json.loads(dr["payload_json"] or "{}")
+                    sg = pdoc.get("subgoal_id")
+                    if sg:
+                        self._conn.execute(
+                            "UPDATE decision_requests SET subgoal_id = ? WHERE req_id = ? AND subgoal_id IS NULL",
+                            (str(sg), str(dr["req_id"])),
+                        )
+
+                self._conn.execute("PRAGMA user_version = 9")
+                self._conn.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.execute("ROLLBACK")
+                raise
+
     def _respawn_migrated_s3_workflows(self) -> None:
         """Best-effort enqueue of replacement snapshot-bound S3 workflows for migrated snapshot-less workflows."""
         with self._lock:
@@ -1540,6 +1652,285 @@ class StateDB:
                 conn, pending, "GOAL_STATUS", goal_id=goal_id, payload={"status": status}, ts=now
             )
 
+    # --------------------------------------------------------------- SubGoals
+
+    def save_subgoal(
+        self, node: SubGoalNode, *, now: float | None = None
+    ) -> SubGoalNode:
+        """Create or update a SubGoalNode in the ledger (ownership-checked)."""
+        ts = time.time() if now is None else float(now)
+        with self._tx() as (conn, pending):
+            existing = conn.execute(
+                "SELECT goal_id, created_ts FROM subgoals WHERE subgoal_id = ?",
+                (node.subgoal_id,),
+            ).fetchone()
+            if existing is not None and str(existing["goal_id"]) != node.goal_id:
+                raise ValueError(
+                    f"Cross-goal ownership violation: subgoal {node.subgoal_id!r} belongs to "
+                    f"goal {existing['goal_id']!r}, not {node.goal_id!r}"
+                )
+            created_ts = (
+                float(existing["created_ts"])
+                if existing is not None
+                else (node.created_ts if node.created_ts > 0 else ts)
+            )
+            stored = SubGoalNode.from_dict(
+                {
+                    **node.to_dict(),
+                    "created_ts": created_ts,
+                    "updated_ts": ts,
+                }
+            )
+            payload_json = json.dumps(stored.to_dict(), sort_keys=True, ensure_ascii=False)
+            conn.execute(
+                """
+                INSERT INTO subgoals (
+                    subgoal_id, goal_id, status, kind, priority_weight,
+                    base_sha, sealed_sha, payload_json, created_ts, updated_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(subgoal_id) DO UPDATE SET
+                    goal_id=excluded.goal_id,
+                    status=excluded.status,
+                    kind=excluded.kind,
+                    priority_weight=excluded.priority_weight,
+                    base_sha=excluded.base_sha,
+                    sealed_sha=excluded.sealed_sha,
+                    payload_json=excluded.payload_json,
+                    updated_ts=excluded.updated_ts
+                """,
+                (
+                    stored.subgoal_id,
+                    stored.goal_id,
+                    stored.status,
+                    stored.kind.value,
+                    float(stored.priority_weight),
+                    stored.base_sha,
+                    stored.sealed_sha,
+                    payload_json,
+                    created_ts,
+                    ts,
+                ),
+            )
+            self._record_event(
+                conn,
+                pending,
+                "SUBGOAL_SAVED",
+                goal_id=stored.goal_id,
+                payload={
+                    "subgoal_id": stored.subgoal_id,
+                    "kind": stored.kind.value,
+                    "status": stored.status,
+                    "priority_weight": float(stored.priority_weight),
+                },
+                ts=ts,
+            )
+        return stored
+
+    def get_subgoal(self, subgoal_id: str) -> SubGoalNode | None:
+        """Fetch a SubGoalNode by subgoal_id."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM subgoals WHERE subgoal_id = ?",
+                (subgoal_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SubGoalNode.from_dict(json.loads(row["payload_json"]))
+
+    def get_goal_subgoal(self, goal_id: str, subgoal_id: str) -> SubGoalNode | None:
+        """Fetch a SubGoalNode by ID and strictly verify `subgoal.goal_id == goal_id`."""
+        sg = self.get_subgoal(subgoal_id)
+        if sg is None:
+            return None
+        if sg.goal_id != goal_id:
+            raise ValueError(
+                f"Cross-goal ownership violation: subgoal {subgoal_id!r} belongs to "
+                f"goal {sg.goal_id!r}, not {goal_id!r}"
+            )
+        return sg
+
+    def list_subgoals(
+        self,
+        goal_id: str | None = None,
+        *,
+        status: str | None = None,
+    ) -> list[SubGoalNode]:
+        """Query SubGoalNodes ordered by descending priority_weight."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if goal_id is not None:
+            clauses.append("goal_id = ?")
+            params.append(goal_id)
+        if status is not None:
+            status_val = status.value if isinstance(status, SubGoalStatus) else str(status)
+            clauses.append("status = ?")
+            params.append(status_val)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = (
+            f"SELECT payload_json FROM subgoals{where} "
+            "ORDER BY priority_weight DESC, created_ts ASC, subgoal_id ASC"
+        )
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [SubGoalNode.from_dict(json.loads(r["payload_json"])) for r in rows]
+
+    def transition_subgoal_status(
+        self,
+        subgoal_id: str,
+        expected_from: str | Sequence[str] | None,
+        new_status: str,
+        *,
+        sealed_sha: str | None = None,
+        params_patch: Mapping[str, Any] | None = None,
+        now: float | None = None,
+    ) -> SubGoalNode:
+        """Atomically transition a SubGoal status if current status matches expectation."""
+        if expected_from is None:
+            expected: set[str] | None = None
+        elif isinstance(expected_from, SubGoalStatus):
+            expected = {expected_from.value}
+        elif isinstance(expected_from, str):
+            expected = {expected_from}
+        else:
+            expected = {
+                s.value if isinstance(s, SubGoalStatus) else str(s)
+                for s in expected_from
+            }
+        target_status = (
+            new_status.value if isinstance(new_status, SubGoalStatus) else str(new_status)
+        )
+        ts = time.time() if now is None else float(now)
+        with self._tx() as (conn, pending):
+            row = conn.execute(
+                "SELECT status, payload_json FROM subgoals WHERE subgoal_id = ?",
+                (subgoal_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown subgoal_id: {subgoal_id}")
+            cur_status = str(row["status"])
+            if expected is not None and cur_status not in expected:
+                raise StateTransitionError(
+                    f"SubGoal {subgoal_id} status is {cur_status!r}, expected one of {sorted(expected)}"
+                )
+            node = SubGoalNode.from_dict(json.loads(row["payload_json"]))
+            node.status = target_status
+            if sealed_sha is not None:
+                node.sealed_sha = sealed_sha
+            if params_patch is not None:
+                node.params = {**dict(node.params), **dict(params_patch)}
+            node.updated_ts = ts
+            payload_json = json.dumps(node.to_dict(), sort_keys=True, ensure_ascii=False)
+            cur = conn.execute(
+                """
+                UPDATE subgoals
+                SET status = ?, sealed_sha = ?, payload_json = ?, updated_ts = ?
+                WHERE subgoal_id = ? AND status = ?
+                """,
+                (
+                    node.status,
+                    node.sealed_sha,
+                    payload_json,
+                    ts,
+                    subgoal_id,
+                    cur_status,
+                ),
+            )
+            if int(cur.rowcount or 0) == 0:
+                raise StateTransitionError(
+                    f"SubGoal {subgoal_id} status changed concurrently from {cur_status!r}"
+                )
+            self._record_event(
+                conn,
+                pending,
+                "SUBGOAL_TRANSITION",
+                goal_id=node.goal_id,
+                payload={
+                    "subgoal_id": subgoal_id,
+                    "from": cur_status,
+                    "to": node.status,
+                    "sealed_sha": node.sealed_sha,
+                },
+                ts=ts,
+            )
+        return node
+
+    def update_subgoal_fields(
+        self,
+        subgoal_id: str,
+        fields_patch: Mapping[str, Any],
+        *,
+        now: float | None = None,
+    ) -> SubGoalNode:
+        """Atomically update mutable fields on a SubGoalNode in SQLite."""
+        mutable_fields = {
+            "title",
+            "direction_thesis",
+            "direct_contribution",
+            "local_metric",
+            "kind",
+            "status",
+            "baseline_value",
+            "target_value",
+            "direction",
+            "kill_criteria",
+            "depends_on_subgoals",
+            "source_subgoal_ids",
+            "track_branch",
+            "base_sha",
+            "sealed_sha",
+            "compute_target",
+            "spec_paths",
+            "writable_prefixes",
+            "priority_weight",
+            "max_tokens_budget",
+            "max_auto_generations",
+            "wave_gated",
+            "params",
+        }
+        ts = time.time() if now is None else float(now)
+        filtered = {k: v for k, v in fields_patch.items() if k in mutable_fields}
+        with self._tx() as (conn, pending):
+            row = conn.execute(
+                "SELECT payload_json FROM subgoals WHERE subgoal_id = ?",
+                (subgoal_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown subgoal_id: {subgoal_id}")
+            cur_doc = json.loads(row["payload_json"])
+            merged_doc = {**cur_doc, **filtered, "updated_ts": ts}
+            node = SubGoalNode.from_dict(merged_doc)
+            payload_json = json.dumps(node.to_dict(), sort_keys=True, ensure_ascii=False)
+            conn.execute(
+                """
+                UPDATE subgoals
+                SET status = ?, kind = ?, priority_weight = ?, base_sha = ?,
+                    sealed_sha = ?, payload_json = ?, updated_ts = ?
+                WHERE subgoal_id = ?
+                """,
+                (
+                    node.status,
+                    node.kind.value,
+                    float(node.priority_weight),
+                    node.base_sha,
+                    node.sealed_sha,
+                    payload_json,
+                    ts,
+                    subgoal_id,
+                ),
+            )
+            self._record_event(
+                conn,
+                pending,
+                "SUBGOAL_FIELDS_UPDATED",
+                goal_id=node.goal_id,
+                payload={
+                    "subgoal_id": subgoal_id,
+                    "fields": sorted(filtered.keys()),
+                },
+                ts=ts,
+            )
+        return node
+
     # ------------------------------------------------------------- Hypotheses
 
     def check_duplicate_fingerprint(
@@ -1625,8 +2016,8 @@ class StateDB:
                 INSERT INTO hypotheses (
                     hypothesis_id, goal_id, parent_id, kind, fidelity, priority_evoi,
                     branch_name, base_sha, head_sha, status, scientific_verdict,
-                    failure_domain, fingerprint, payload_json, created_ts, updated_ts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    failure_domain, subgoal_id, fingerprint, payload_json, created_ts, updated_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized.hypothesis_id,
@@ -1641,6 +2032,7 @@ class StateDB:
                     normalized.status,
                     normalized.scientific_verdict.value,
                     normalized.failure_domain.value,
+                    normalized.subgoal_id,
                     fp,
                     payload_json,
                     now,
@@ -1684,8 +2076,9 @@ class StateDB:
     def list_hypotheses(
         self,
         goal_id: str | None = None,
-        *,
         status: str | None = None,
+        subgoal_id: str | None = None,
+        *,
         kind: HypothesisKind | str | None = None,
     ) -> list[HypothesisNode]:
         """Query hypotheses ordered by descending priority_evoi."""
@@ -1701,6 +2094,9 @@ class StateDB:
             kind_val = kind.value if isinstance(kind, HypothesisKind) else HypothesisKind(kind).value
             clauses.append("kind = ?")
             params.append(kind_val)
+        if subgoal_id is not None:
+            clauses.append("subgoal_id = ?")
+            params.append(subgoal_id)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         query = (
             f"SELECT payload_json FROM hypotheses{where} "
@@ -1737,10 +2133,43 @@ class StateDB:
                 raise KeyError(f"Unknown hypothesis_id: {hypothesis_id}")
             node = HypothesisNode.from_dict(json.loads(row["payload_json"]))
             node.params = {**dict(node.params), **dict(params_patch)}
+            if "subgoal_id" in params_patch:
+                raw_sg = params_patch.get("subgoal_id")
+                node.subgoal_id = str(raw_sg) if raw_sg else None
             payload_json = json.dumps(node.to_dict(), sort_keys=True, ensure_ascii=False)
             conn.execute(
-                "UPDATE hypotheses SET payload_json = ?, updated_ts = ? WHERE hypothesis_id = ?",
-                (payload_json, ts, hypothesis_id),
+                "UPDATE hypotheses SET subgoal_id = ?, payload_json = ?, updated_ts = ? WHERE hypothesis_id = ?",
+                (node.subgoal_id, payload_json, ts, hypothesis_id),
+            )
+        return node
+
+    def update_hypothesis_fields(
+        self,
+        hypothesis_id: str,
+        fields_patch: Mapping[str, Any],
+        *,
+        now: float | None = None,
+    ) -> HypothesisNode:
+        """Update mutable spec fields (statement, mechanism, *_cmd, subgoal_id) on a hypothesis in SQLite."""
+        allowed = {"statement", "mechanism", "acceptance_cmd", "screen_cmd", "confirm_cmd"}
+        ts = float(now if now is not None else time.time())
+        with self._tx() as (conn, _pending):
+            row = conn.execute(
+                "SELECT payload_json FROM hypotheses WHERE hypothesis_id = ?",
+                (hypothesis_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown hypothesis_id: {hypothesis_id}")
+            node = HypothesisNode.from_dict(json.loads(row["payload_json"]))
+            for k, v in fields_patch.items():
+                if k in allowed and isinstance(v, str):
+                    setattr(node, k, v)
+                elif k == "subgoal_id" and (v is None or isinstance(v, str)):
+                    node.subgoal_id = v if v else None
+            payload_json = json.dumps(node.to_dict(), sort_keys=True, ensure_ascii=False)
+            conn.execute(
+                "UPDATE hypotheses SET subgoal_id = ?, payload_json = ?, updated_ts = ? WHERE hypothesis_id = ?",
+                (node.subgoal_id, payload_json, ts, hypothesis_id),
             )
         return node
 
@@ -1764,8 +2193,8 @@ class StateDB:
             node.priority_evoi = float(priority_evoi)
             payload_json = json.dumps(node.to_dict(), sort_keys=True, ensure_ascii=False)
             conn.execute(
-                "UPDATE hypotheses SET priority_evoi = ?, payload_json = ?, updated_ts = ? WHERE hypothesis_id = ?",
-                (float(priority_evoi), payload_json, ts, hypothesis_id),
+                "UPDATE hypotheses SET priority_evoi = ?, subgoal_id = ?, payload_json = ?, updated_ts = ? WHERE hypothesis_id = ?",
+                (float(priority_evoi), node.subgoal_id, payload_json, ts, hypothesis_id),
             )
             self._record_event(
                 conn,
@@ -1842,7 +2271,7 @@ class StateDB:
                 """
                 UPDATE hypotheses
                 SET status = ?, head_sha = ?, scientific_verdict = ?, fidelity = ?,
-                    failure_domain = ?, payload_json = ?, updated_ts = ?
+                    failure_domain = ?, subgoal_id = ?, payload_json = ?, updated_ts = ?
                 WHERE hypothesis_id = ? AND status = ?
                 """,
                 (
@@ -1851,6 +2280,7 @@ class StateDB:
                     node.scientific_verdict.value,
                     node.fidelity.value,
                     node.failure_domain.value,
+                    node.subgoal_id,
                     payload_json,
                     ts,
                     hypothesis_id,
@@ -1883,6 +2313,7 @@ class StateDB:
         exp_plan_id: str | None = None,
         uncertainty_id: str | None = None,
         tags: Sequence[str] | None = None,
+        subgoal_id: str | None = None,
         now: float | None = None,
     ) -> HypothesisNode:
         """Atomically update V3 failure_domain, budget_state, plan link, or tags on a hypothesis."""
@@ -1909,14 +2340,16 @@ class StateDB:
                 node.uncertainty_id = uncertainty_id
             if tags is not None:
                 node.tags = [str(t) for t in tags]
+            if subgoal_id is not None:
+                node.subgoal_id = subgoal_id if subgoal_id else None
             payload_json = json.dumps(node.to_dict(), sort_keys=True, ensure_ascii=False)
             conn.execute(
                 """
                 UPDATE hypotheses
-                SET failure_domain = ?, payload_json = ?, updated_ts = ?
+                SET failure_domain = ?, subgoal_id = ?, payload_json = ?, updated_ts = ?
                 WHERE hypothesis_id = ?
                 """,
-                (node.failure_domain.value, payload_json, ts, hypothesis_id),
+                (node.failure_domain.value, node.subgoal_id, payload_json, ts, hypothesis_id),
             )
         return node
 
@@ -1965,12 +2398,13 @@ class StateDB:
             conn.execute(
                 """
                 UPDATE hypotheses
-                SET status = ?, scientific_verdict = ?, payload_json = ?, updated_ts = ?
+                SET status = ?, scientific_verdict = ?, subgoal_id = ?, payload_json = ?, updated_ts = ?
                 WHERE hypothesis_id = ?
                 """,
                 (
                     node.status,
                     node.scientific_verdict.value,
+                    node.subgoal_id,
                     json.dumps(node.to_dict(), sort_keys=True, ensure_ascii=False),
                     now,
                     hypothesis_id,
@@ -3690,6 +4124,7 @@ class StateDB:
         item["role"] = derived_role
         item["attempt"] = int(payload.get("attempt", 1))
         item["model_spec"] = str(payload.get("model_spec", ""))
+        item["subgoal_id"] = item.get("subgoal_id") or payload.get("subgoal_id") or None
         item["payload"] = payload
         item["resolution"] = resolution
         return item
@@ -3709,6 +4144,7 @@ class StateDB:
         coalesce_window_s: float = 0.0,
         payload: Mapping[str, Any] | None = None,
         req_id: str | None = None,
+        subgoal_id: str | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
         """Enqueue a per-Goal decision request, optionally coalescing pending requests."""
@@ -3726,6 +4162,17 @@ class StateDB:
         eff_model_col = str(body.get("model_spec") or "")
         body["attempt"] = int(body.get("attempt", attempt))
         eff_attempt = int(body["attempt"])
+        eff_subgoal_id = (
+            str(subgoal_id).strip()
+            if subgoal_id is not None and str(subgoal_id).strip()
+            else (
+                str(body["subgoal_id"]).strip()
+                if body.get("subgoal_id") and str(body["subgoal_id"]).strip()
+                else None
+            )
+        )
+        if eff_subgoal_id is not None:
+            body["subgoal_id"] = eff_subgoal_id
 
         with self._tx() as (conn, pending):
             if coalesce_key:
@@ -3742,6 +4189,11 @@ class StateDB:
                         **json.loads(existing["payload_json"]),
                         **body,
                     }
+                    merged_subgoal_id = (
+                        str(merged_payload["subgoal_id"]).strip()
+                        if merged_payload.get("subgoal_id") and str(merged_payload["subgoal_id"]).strip()
+                        else (existing["subgoal_id"] or None)
+                    )
                     payload_json = json.dumps(
                         merged_payload, sort_keys=True, ensure_ascii=False
                     )
@@ -3749,7 +4201,7 @@ class StateDB:
                         """
                         UPDATE decision_requests
                         SET tier = ?, role = ?, model_spec = ?, attempt = ?,
-                            goal_version = ?, human_epoch = ?,
+                            subgoal_id = ?, goal_version = ?, human_epoch = ?,
                             payload_json = ?, updated_ts = ?
                         WHERE req_id = ?
                         """,
@@ -3758,6 +4210,7 @@ class StateDB:
                             str(merged_payload.get("role") or ""),
                             str(merged_payload.get("model_spec") or ""),
                             int(merged_payload.get("attempt", 1)),
+                            merged_subgoal_id,
                             int(goal_version),
                             int(human_epoch),
                             payload_json,
@@ -3779,6 +4232,7 @@ class StateDB:
                             "tier": tier,
                             "role": str(merged_payload.get("role") or ""),
                             "coalesce_key": coalesce_key,
+                            "subgoal_id": merged_subgoal_id,
                         },
                         ts=ts,
                     )
@@ -3789,12 +4243,12 @@ class StateDB:
             conn.execute(
                 """
                 INSERT INTO decision_requests (
-                    req_id, goal_id, tier, role, model_spec, attempt,
+                    req_id, goal_id, tier, role, model_spec, attempt, subgoal_id,
                     trigger_kind, status,
                     goal_version, human_epoch, coalesce_key, available_ts,
                     payload_json, resolution_json, hq_job_id,
                     created_ts, updated_ts, resolved_ts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, '{}', NULL, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, '{}', NULL, ?, ?, NULL)
                 """,
                 (
                     eff_id,
@@ -3803,6 +4257,7 @@ class StateDB:
                     eff_role_col,
                     eff_model_col,
                     eff_attempt,
+                    eff_subgoal_id,
                     trigger_kind,
                     int(goal_version),
                     int(human_epoch),
@@ -3823,6 +4278,7 @@ class StateDB:
                     "tier": tier,
                     "role": eff_role_col,
                     "attempt": eff_attempt,
+                    "subgoal_id": eff_subgoal_id,
                     "trigger_kind": trigger_kind,
                     "goal_version": int(goal_version),
                     "human_epoch": int(human_epoch),
@@ -3850,6 +4306,7 @@ class StateDB:
         status: str | None = None,
         tier: str | None = None,
         role: ScientificRole | str | None = None,
+        subgoal_id: str | None = None,
         ready_before_ts: float | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
@@ -3865,6 +4322,9 @@ class StateDB:
         if tier is not None:
             clauses.append("tier = ?")
             params.append(tier)
+        if subgoal_id is not None:
+            clauses.append("subgoal_id = ?")
+            params.append(subgoal_id)
         if ready_before_ts is not None:
             clauses.append("available_ts <= ?")
             params.append(float(ready_before_ts))

@@ -76,6 +76,28 @@ class ConstraintStrength(str, Enum):
     SOFT_FALLBACK = "SOFT_FALLBACK"
 
 
+class SubGoalKind(str, Enum):
+    """Category of decomposed SubGoal track under a ResearchGoal."""
+
+    DIRECTION_TRACK = "DIRECTION_TRACK"
+    FOUNDATION_BUILD = "FOUNDATION_BUILD"
+    DIAGNOSTIC_PROBE = "DIAGNOSTIC_PROBE"
+    COMPETING_RACE = "COMPETING_RACE"
+    INTEGRATION_MERGE = "INTEGRATION_MERGE"
+
+
+class SubGoalStatus(str, Enum):
+    """Lifecycle status of a SubGoal track."""
+
+    ACTIVE = "ACTIVE"
+    LOCKED_DEP = "LOCKED_DEP"
+    PAUSED = "PAUSED"
+    AWAITING_APEX = "AWAITING_APEX"
+    SEALED = "SEALED"
+    MERGED = "MERGED"
+    KILLED = "KILLED"
+
+
 class ActionKind(str, Enum):
     """Typed closed-loop action emitted by ResearchLead or ResearchDirector."""
 
@@ -92,6 +114,11 @@ class ActionKind(str, Enum):
     TERMINATE_REFUTED_ROUTE = "TERMINATE_REFUTED_ROUTE"
     COMPLETE_MILESTONE = "COMPLETE_MILESTONE"
     REQUEST_OWNER_DECISION = "REQUEST_OWNER_DECISION"
+    SPAWN_SUBGOAL = "SPAWN_SUBGOAL"
+    RETUNE_SUBGOAL = "RETUNE_SUBGOAL"
+    MERGE_SUBGOALS = "MERGE_SUBGOALS"
+    KILL_AND_REALLOCATE = "KILL_AND_REALLOCATE"
+    SYNC_SUBGOAL_BASE = "SYNC_SUBGOAL_BASE"
 
 
 class FidelityRung(str, Enum):
@@ -342,6 +369,117 @@ class ResearchGoal:
 
 
 @dataclass
+class SubGoalNode:
+    """Decomposed sub-problem / direction track under a ResearchGoal."""
+
+    subgoal_id: str
+    goal_id: str
+    title: str
+    direction_thesis: str
+    direct_contribution: str
+    local_metric: str
+    kind: SubGoalKind = SubGoalKind.DIRECTION_TRACK
+    status: str = "ACTIVE"
+    baseline_value: float = 0.0
+    target_value: float | None = None
+    direction: str = "maximize"
+    kill_criteria: list[str] = field(default_factory=list)
+    depends_on_subgoals: list[str] = field(default_factory=list)
+    source_subgoal_ids: list[str] = field(default_factory=list)
+    track_branch: str = ""
+    base_sha: str = ""
+    sealed_sha: str | None = None
+    compute_target: str = "cpu_only"
+    spec_paths: list[str] = field(default_factory=list)
+    writable_prefixes: list[str] = field(default_factory=list)
+    priority_weight: float = 1.0
+    max_tokens_budget: int = 0
+    max_auto_generations: int = 1
+    wave_gated: bool = True
+    params: dict[str, Any] = field(default_factory=dict)
+    created_ts: float = 0.0
+    updated_ts: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-compatible dictionary."""
+        status_str = (
+            self.status.value if isinstance(self.status, SubGoalStatus) else str(self.status)
+        )
+        return {
+            "subgoal_id": self.subgoal_id,
+            "goal_id": self.goal_id,
+            "title": self.title,
+            "direction_thesis": self.direction_thesis,
+            "direct_contribution": self.direct_contribution,
+            "local_metric": self.local_metric,
+            "kind": _coerce_enum(SubGoalKind, self.kind).value,
+            "status": status_str,
+            "baseline_value": float(self.baseline_value),
+            "target_value": None if self.target_value is None else float(self.target_value),
+            "direction": str(self.direction),
+            "kill_criteria": [str(x) for x in self.kill_criteria],
+            "depends_on_subgoals": [str(x) for x in self.depends_on_subgoals],
+            "source_subgoal_ids": [str(x) for x in self.source_subgoal_ids],
+            "track_branch": str(self.track_branch),
+            "base_sha": str(self.base_sha),
+            "sealed_sha": None if self.sealed_sha is None else str(self.sealed_sha),
+            "compute_target": str(self.compute_target),
+            "spec_paths": [str(x) for x in self.spec_paths],
+            "writable_prefixes": [str(x) for x in self.writable_prefixes],
+            "priority_weight": float(self.priority_weight),
+            "max_tokens_budget": int(self.max_tokens_budget),
+            "max_auto_generations": int(self.max_auto_generations),
+            "wave_gated": bool(self.wave_gated),
+            "params": _serialize_value(dict(self.params)),
+            "created_ts": float(self.created_ts),
+            "updated_ts": float(self.updated_ts),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SubGoalNode:
+        """Deserialize from a dictionary."""
+        raw_status = data.get("status", "ACTIVE")
+        status_str = (
+            raw_status.value if isinstance(raw_status, SubGoalStatus) else str(raw_status)
+        )
+        raw_target = data.get("target_value")
+        raw_sealed = data.get("sealed_sha")
+        raw_params = data.get("params")
+        raw_baseline = data.get("baseline_value", 0.0)
+        return cls(
+            subgoal_id=str(data["subgoal_id"]),
+            goal_id=str(data["goal_id"]),
+            title=str(data["title"]),
+            direction_thesis=str(data["direction_thesis"]),
+            direct_contribution=str(data["direct_contribution"]),
+            local_metric=str(data["local_metric"]),
+            kind=_coerce_enum(
+                SubGoalKind, data.get("kind", SubGoalKind.DIRECTION_TRACK)
+            ),
+            status=status_str,
+            baseline_value=0.0 if raw_baseline is None else float(raw_baseline),
+            target_value=None if raw_target is None else float(raw_target),
+            direction=str(data.get("direction", "maximize")),
+            kill_criteria=[str(x) for x in (data.get("kill_criteria") or [])],
+            depends_on_subgoals=[str(x) for x in (data.get("depends_on_subgoals") or [])],
+            source_subgoal_ids=[str(x) for x in (data.get("source_subgoal_ids") or [])],
+            track_branch=str(data.get("track_branch", "")),
+            base_sha=str(data.get("base_sha", "")),
+            sealed_sha=None if raw_sealed is None else str(raw_sealed),
+            compute_target=str(data.get("compute_target", "cpu_only")),
+            spec_paths=[str(x) for x in (data.get("spec_paths") or [])],
+            writable_prefixes=[str(x) for x in (data.get("writable_prefixes") or [])],
+            priority_weight=float(data.get("priority_weight", 1.0)),
+            max_tokens_budget=int(data.get("max_tokens_budget", 0)),
+            max_auto_generations=int(data.get("max_auto_generations", 1)),
+            wave_gated=bool(data.get("wave_gated", True)),
+            params=dict(raw_params) if isinstance(raw_params, Mapping) else {},
+            created_ts=float(data.get("created_ts", 0.0)),
+            updated_ts=float(data.get("updated_ts", 0.0)),
+        )
+
+
+@dataclass
 class WorkflowNode:
     """Workflow execution node in the 4-level Goal -> Hypothesis -> Workflow -> Task tree."""
 
@@ -430,6 +568,7 @@ class HypothesisNode:
     exp_plan_id: str | None = None
     failure_domain: FailureDomain = FailureDomain.NONE
     budget_state: dict[str, Any] = field(default_factory=default_hypothesis_budget_state)
+    subgoal_id: str | None = None
 
     @property
     def routing_policy(self) -> dict[str, Any]:
@@ -481,6 +620,7 @@ class HypothesisNode:
                 FailureDomain, self.failure_domain
             ).value,
             "budget_state": _serialize_value(merged_budget),
+            "subgoal_id": self.subgoal_id,
         }
 
     @classmethod
@@ -526,6 +666,16 @@ class HypothesisNode:
                 FailureDomain, data.get("failure_domain", FailureDomain.NONE)
             ),
             budget_state=merged_budget,
+            subgoal_id=(
+                str(data["subgoal_id"])
+                if data.get("subgoal_id")
+                else (
+                    str((data.get("params") or {}).get("subgoal_id"))
+                    if isinstance(data.get("params"), Mapping)
+                    and (data.get("params") or {}).get("subgoal_id")
+                    else None
+                )
+            ),
         )
 
 
@@ -1259,6 +1409,7 @@ class LeadAction:
     parameters: dict[str, Any] = field(default_factory=dict)
     workflow_primitive: str | None = None
     review_tier: ReviewTier | None = None
+    target_subgoal_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -1272,6 +1423,7 @@ class LeadAction:
             "review_tier": None
             if self.review_tier is None
             else _coerce_enum(ReviewTier, self.review_tier).value,
+            "target_subgoal_id": self.target_subgoal_id,
         }
 
     @classmethod
@@ -1288,6 +1440,14 @@ class LeadAction:
             review_tier=None
             if raw_tier is None
             else _coerce_enum(ReviewTier, raw_tier),
+            target_subgoal_id=(
+                data.get("target_subgoal_id")
+                or (
+                    (data.get("parameters") or {}).get("subgoal_id")
+                    if isinstance(data.get("parameters"), Mapping)
+                    else None
+                )
+            ),
         )
 
 

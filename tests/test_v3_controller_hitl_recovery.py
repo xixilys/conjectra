@@ -1512,6 +1512,410 @@ def test_stage4_daemon_exception_isolation_and_cli_restart_loop(
     assert attempts["count"] == 6
 
 
+def test_hydrate_events_beyond_5000_and_terminal_workflow_no_fallthrough(
+    tmp_path: Path,
+) -> None:
+    """Hydration paginates >5000 events and terminal workflows never fall through to standalone retries."""
+    repo = tmp_path / "repo"
+    base_sha = _init_repo(repo)
+    home = tmp_path / "arr"
+    with StateDB(home) as db:
+        goal = _make_goal("g_hydrate", repo, base_sha, project="projgamma")
+        db.save_goal(goal, status="ACTIVE")
+        hyp = _make_hyp(goal, "h_term_wf")
+        db.register_hypothesis(hyp)
+
+        # Populate >5000 events before CONTROLLER_TASK_HANDLED
+        with db._tx() as (conn, pending):
+            for idx in range(5050):
+                db._record_event(
+                    conn,
+                    pending,
+                    "HEARTBEAT_PAD",
+                    goal_id=goal.goal_id,
+                    payload={"i": idx},
+                )
+            db._record_event(
+                conn,
+                pending,
+                "CONTROLLER_TASK_HANDLED",
+                goal_id=goal.goal_id,
+                hypothesis_id=hyp.hypothesis_id,
+                task_id="tsk-past-5000",
+                payload={"stage": "CODE", "status": "DONE"},
+            )
+
+        wf = WorkflowNode(
+            workflow_id="wf_blocked_term",
+            goal_id=goal.goal_id,
+            hypothesis_id=hyp.hypothesis_id,
+            primitive="direct_hq",
+            status="BLOCKED_REVIEW_QUORUM",
+            goal_version=goal.version,
+        )
+        db.save_workflow(wf)
+
+        failed_review = StageTask(
+            task_id="tsk-term-review-s1",
+            idempotency_key="g_hydrate:h_term_wf:wf_blocked_term:design_review_s1:a1",
+            goal_id=goal.goal_id,
+            hypothesis_id=hyp.hypothesis_id,
+            stage=StageKind.DESIGN_REVIEW,
+            deps=[],
+            status="FAILED",
+            attempt=1,
+            max_attempts=3,
+            workflow_id=wf.workflow_id,
+            workflow_primitive="direct_hq",
+            step_key="design_review_s1",
+            resources=ResourceSpec(cpus=1, ram_mb=1024, llm_pool="codex"),
+        )
+        sibling_ready = StageTask(
+            task_id="tsk-term-sibling-ready",
+            idempotency_key="g_hydrate:h_term_wf:wf_blocked_term:design_review_s0:a1",
+            goal_id=goal.goal_id,
+            hypothesis_id=hyp.hypothesis_id,
+            stage=StageKind.DESIGN_REVIEW,
+            deps=[],
+            status="READY",
+            attempt=1,
+            max_attempts=3,
+            workflow_id=wf.workflow_id,
+            workflow_primitive="direct_hq",
+            step_key="design_review_s0",
+            resources=ResourceSpec(cpus=1, ram_mb=1024, llm_pool="codex"),
+        )
+        dep_ready = StageTask(
+            task_id="tsk-term-dep-ready",
+            idempotency_key="g_hydrate:h_term_wf:wf_blocked_term:exp_screen:a1",
+            goal_id=goal.goal_id,
+            hypothesis_id=hyp.hypothesis_id,
+            stage=StageKind.EXP_SCREEN,
+            deps=[sibling_ready.task_id],
+            status="READY",
+            attempt=1,
+            max_attempts=3,
+            workflow_id=wf.workflow_id,
+            workflow_primitive="direct_hq",
+            step_key="exp_screen",
+            resources=ResourceSpec(cpus=1, ram_mb=1024, llm_pool="codex"),
+        )
+        db.enqueue_task(failed_review)
+        db.enqueue_task(sibling_ready)
+        db.enqueue_task(dep_ready)
+        db.record_receipt(
+            EvidenceReceipt(
+                receipt_id="rcpt-term-review-s1",
+                task_id=failed_review.task_id,
+                goal_id=goal.goal_id,
+                hypothesis_id=hyp.hypothesis_id,
+                stage=StageKind.DESIGN_REVIEW,
+                base_sha=base_sha,
+                head_sha=base_sha,
+                command="design_review",
+                exit_code=0,
+                wall_sec=1.0,
+                max_rss_mb=32.0,
+                in_tokens=10,
+                out_tokens=10,
+                model_used="codex:gpt-5-codex",
+                process_status=ProcessStatus.EXIT_OK,
+                engineering_verdict=EngineeringVerdict.FAIL_GATE,
+                scientific_verdict=ScientificVerdict.UNKNOWN,
+                audit_verdict=AuditVerdict.FAIL,
+                failure_domain=FailureDomain.ENGINEERING_DEFECT,
+                tests_passed=0,
+                tests_total=0,
+                metrics={},
+                raw_artifact_paths=[],
+            )
+        )
+
+        ctrl = ResearchController(home, execution_mode="inline", propose_mode="seeds", dry_run_llm=True)
+        try:
+            assert "tsk-past-5000" in ctrl._handled_tasks
+
+            summary: dict[str, Any] = {
+                "reconciled": 0,
+                "tasks_enqueued": 0,
+                "pruned": 0,
+                "stale_isolated": 0,
+            }
+            ctrl._handle_completed_task(failed_review, goal, summary)
+            assert summary["tasks_enqueued"] == 0
+            assert len(db.list_tasks(goal_id=goal.goal_id, hypothesis_id=hyp.hypothesis_id)) == 3
+            sib = db.get_task("tsk-term-sibling-ready")
+            dep_sib = db.get_task("tsk-term-dep-ready")
+            assert sib is not None and sib.status == "CANCELLED"
+            assert dep_sib is not None and dep_sib.status == "CANCELLED"
+        finally:
+            ctrl.close()
+
+
+def test_decision_exclude_specs_lease_renew_and_bounded_infra_retry(
+    tmp_path: Path,
+) -> None:
+    """DecisionEngine honors exclude_specs + renews active lease; controller retries INFRA_TRANSIENT once."""
+    from conjectra.decision_engine import DecisionEngine
+
+    repo = tmp_path / "repo"
+    base_sha = _init_repo(repo)
+    home = tmp_path / "arr"
+    with StateDB(home) as db:
+        goal = _make_goal("g_dec_retry", repo, base_sha, project="projgamma")
+        db.save_goal(goal, status="ACTIVE")
+        hyp = _make_hyp(goal, "h_dec_1")
+        db.register_hypothesis(hyp)
+
+        router = ModelRouter(arr_home=home)
+        engine = DecisionEngine(db, router=router)
+
+        # Verify renew_lease extends active lease on process_request start
+        req_ok = engine.enqueue_decision(
+            goal.goal_id,
+            role=ScientificRole.RESEARCH_LEAD,
+            trigger_kind="EVIDENCE_UPDATE",
+            urgency="IMMEDIATE",
+        )
+        lease = db.acquire_lease(
+            f"decision:{goal.goal_id}:{req_ok['req_id']}",
+            f"dec-{req_ok['req_id']}",
+            holder="hq-test",
+            ttl_s=60.0,
+            goal_id=goal.goal_id,
+        )
+        assert lease is not None
+        orig_exp = float(lease["expires_ts"])
+        with db._tx() as (conn, _p):
+            conn.execute(
+                "UPDATE decision_requests SET status = 'RUNNING', payload_json = ? WHERE req_id = ?",
+                (
+                    json.dumps({**req_ok["payload"], "lease_id": lease["lease_id"]}),
+                    req_ok["req_id"],
+                ),
+            )
+        seen_exp: dict[str, float] = {}
+
+        def _check_renew_llm(_prov: Any, _prompt: str) -> dict[str, Any]:
+            row = db._conn.execute(
+                "SELECT expires_ts FROM leases WHERE lease_id = ?", (lease["lease_id"],)
+            ).fetchone()
+            seen_exp["val"] = float(row["expires_ts"])
+            return {"exit_code": 1, "response": "", "in_tokens": 10, "out_tokens": 0}
+
+        engine.process_request(
+            req_ok["req_id"],
+            llm_caller=_check_renew_llm,
+            expected_lease_id=lease["lease_id"],
+        )
+        assert seen_exp["val"] > orig_exp + 100.0
+        db.resolve_decision_request(req_ok["req_id"], status="CANCELLED", resolution={"reason": "test_done"})
+
+        # Verify exclude_specs skips excluded candidate in resolve_route_for_role
+        r_default = engine.resolve_route_for_role(ScientificRole.RESEARCH_LEAD, goal=goal)
+        r_excl = engine.resolve_route_for_role(
+            ScientificRole.RESEARCH_LEAD,
+            goal=goal,
+            exclude_specs=[r_default.canonical_spec()],
+        )
+        assert r_excl.canonical_spec() != r_default.canonical_spec()
+
+        # Verify controller bounded INFRA_TRANSIENT retry (attempt 1 -> attempt 2, attempt 2 stays FAILED)
+        req_f1 = engine.enqueue_decision(
+            goal.goal_id,
+            role=ScientificRole.RESEARCH_LEAD,
+            trigger_kind="EVIDENCE_UPDATE",
+            urgency="IMMEDIATE",
+        )
+        db.resolve_decision_request(
+            req_f1["req_id"],
+            status="FAILED",
+            resolution={
+                "failure_domain": FailureDomain.INFRA_TRANSIENT.value,
+                "reason": "Provider exited with code 124",
+                "model_used": "codex:gpt-5-codex",
+            },
+        )
+        ctrl = ResearchController(home, execution_mode="inline", propose_mode="seeds", dry_run_llm=True)
+        try:
+            goals_by_id = {goal.goal_id: goal}
+            summary: dict[str, Any] = {"tasks_enqueued": 0}
+            ctrl._sweep_decision_requests(goals_by_id, summary)
+            old_row = db.get_decision_request(req_f1["req_id"])
+            assert old_row is not None and old_row["status"] == "SUPERSEDED_FAILED"
+            assert summary.get("retried_infra_decisions") == 1
+            all_reqs = db.list_decision_requests(goal_id=goal.goal_id)
+            retried = [r for r in all_reqs if (r.get("payload") or {}).get("retried_from_req_id") == req_f1["req_id"]]
+            assert len(retried) == 1
+            assert int(retried[0]["attempt"]) == 2
+            assert "codex:gpt-5-codex" in (retried[0]["payload"].get("exclude_specs") or [])
+
+            # If attempt 2 also fails, controller must NOT retry endlessly
+            with db._tx() as (conn, _p):
+                conn.execute(
+                    "UPDATE decision_requests SET status = 'FAILED' WHERE req_id = ?",
+                    (retried[0]["req_id"],),
+                )
+            db.resolve_decision_request(
+                retried[0]["req_id"],
+                status="FAILED",
+                resolution={
+                    "failure_domain": FailureDomain.INFRA_TRANSIENT.value,
+                    "reason": "Provider exited with code 124",
+                    "model_used": "gemini:gemini-flash",
+                },
+            )
+            ctrl._sweep_decision_requests(goals_by_id, summary)
+            still_failed = db.get_decision_request(retried[0]["req_id"])
+            assert still_failed is not None and still_failed["status"] == "FAILED"
+
+            # Atomic rollback check: if enqueue_decision_request fails mid-retry, FAILED status is NOT lost
+            req_atomic = engine.enqueue_decision(
+                goal.goal_id,
+                role=ScientificRole.RESEARCH_LEAD,
+                trigger_kind="EVIDENCE_UPDATE",
+                urgency="COALESCED",
+                coalesce_window_s=0.0,
+            )
+            db.resolve_decision_request(
+                req_atomic["req_id"],
+                status="FAILED",
+                resolution={
+                    "failure_domain": FailureDomain.INFRA_TRANSIENT.value,
+                    "reason": "Provider exited with code 124",
+                    "model_used": "codex:gpt-5-codex",
+                },
+            )
+            orig_enq = ctrl.db.enqueue_decision_request
+
+            def _boom_enq(*_a: Any, **_kw: Any) -> dict[str, Any]:
+                raise RuntimeError("simulated enqueue crash")
+
+            ctrl.db.enqueue_decision_request = _boom_enq  # type: ignore[method-assign]
+            try:
+                ctrl._sweep_decision_requests(goals_by_id, summary)
+            finally:
+                ctrl.db.enqueue_decision_request = orig_enq  # type: ignore[method-assign]
+            row_after_crash = db.get_decision_request(req_atomic["req_id"])
+            assert row_after_crash is not None and row_after_crash["status"] == "FAILED"
+
+            # Newer RESOLVED decision supersedes older FAILED without re-enqueueing
+            req_old_fail = engine.enqueue_decision(
+                goal.goal_id,
+                role=ScientificRole.RESEARCH_LEAD,
+                trigger_kind="EVIDENCE_UPDATE",
+                urgency="COALESCED",
+                coalesce_window_s=0.0,
+            )
+            db.resolve_decision_request(
+                req_old_fail["req_id"],
+                status="FAILED",
+                resolution={
+                    "failure_domain": FailureDomain.INFRA_TRANSIENT.value,
+                    "reason": "Provider exited with code 124",
+                    "model_used": "codex:gpt-5-codex",
+                },
+            )
+            req_newer_ok = engine.enqueue_decision(
+                goal.goal_id,
+                role=ScientificRole.RESEARCH_LEAD,
+                trigger_kind="EVIDENCE_UPDATE",
+                urgency="COALESCED",
+                coalesce_window_s=0.0,
+            )
+            db.resolve_decision_request(
+                req_newer_ok["req_id"],
+                status="RESOLVED",
+                resolution={"accepted_hypothesis_ids": [], "in_tokens": 10, "out_tokens": 5},
+            )
+            with db._tx() as (conn, _p):
+                conn.execute(
+                    "UPDATE decision_requests SET status = 'CANCELLED' WHERE req_id = ?",
+                    (req_atomic["req_id"],),
+                )
+            prev_enq_count = len(db.list_decision_requests(goal_id=goal.goal_id))
+            ctrl._sweep_decision_requests(goals_by_id, summary)
+            old_fail_row = db.get_decision_request(req_old_fail["req_id"])
+            assert old_fail_row is not None and old_fail_row["status"] == "SUPERSEDED_FAILED"
+            # Attempt-2 FAILED decision is also superseded once a newer decision resolves
+            still_failed_after_ok = db.get_decision_request(retried[0]["req_id"])
+            assert still_failed_after_ok is not None and still_failed_after_ok["status"] == "SUPERSEDED_FAILED"
+            assert len(db.list_decision_requests(goal_id=goal.goal_id)) == prev_enq_count
+
+            # HARD-pinned failed decision must NOT exclude its forced model spec on retry
+            req_hard_fail = engine.enqueue_decision(
+                goal.goal_id,
+                role=ScientificRole.RESEARCH_LEAD,
+                trigger_kind="USER_PROBE",
+                urgency="IMMEDIATE",
+            )
+            with db._tx() as (conn, _p):
+                conn.execute(
+                    "UPDATE decision_requests SET payload_json = ? WHERE req_id = ?",
+                    (
+                        json.dumps(
+                            {
+                                **req_hard_fail["payload"],
+                                "pinned_route": {"strength": "HARD", "canonical_model": "gpt-5-codex"},
+                            }
+                        ),
+                        req_hard_fail["req_id"],
+                    ),
+                )
+            db.resolve_decision_request(
+                req_hard_fail["req_id"],
+                status="FAILED",
+                resolution={
+                    "failure_domain": FailureDomain.INFRA_TRANSIENT.value,
+                    "reason": "Provider exited with code 124",
+                    "model_used": "codex:gpt-5-codex",
+                },
+            )
+            ctrl._sweep_decision_requests(goals_by_id, summary)
+            hard_retried = [
+                r
+                for r in db.list_decision_requests(goal_id=goal.goal_id)
+                if (r.get("payload") or {}).get("retried_from_req_id") == req_hard_fail["req_id"]
+            ]
+            assert len(hard_retried) == 1
+            assert (hard_retried[0]["payload"].get("exclude_specs") or []) == []
+        finally:
+            ctrl.close()
+
+
+def test_controller_pid_lock_rejects_live_tuple_start_time_and_preserves_unowned_sock(
+    tmp_path: Path,
+) -> None:
+    """_acquire_pid_lock must reject live controller.pid with [state, ticks] proc_start_time and never unlink another PID's reactor.sock."""
+    import sys
+
+    from conjectra.arbiter import read_proc_start_time
+
+    home = tmp_path / "arr_pid"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        parsed = read_proc_start_time(proc.pid)
+        assert parsed is not None
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "controller.pid").write_text(
+            json.dumps({"pid": proc.pid, "proc_start_time": list(parsed), "started_ts": time.time()}),
+            encoding="utf-8",
+        )
+        (home / "reactor.sock").write_text("live-sock", encoding="utf-8")
+
+        ctrl = ResearchController(home, execution_mode="inline", propose_mode="seeds", dry_run_llm=True)
+        try:
+            with pytest.raises(RuntimeError, match="already running"):
+                ctrl._acquire_pid_lock()
+            ctrl._release_sock_if_owned()
+            assert (home / "reactor.sock").exists()
+        finally:
+            ctrl.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 
 
 

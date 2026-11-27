@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from conjectra.arbiter import (
     GlobalResourceScheduler,
@@ -20,6 +20,7 @@ from conjectra.types import (
     ResearchGoal,
     ReviewKind,
     ScientificVerdict,
+    SubGoalNode,
 )
 
 ACTIVE_TASK_STATES = frozenset({"DISPATCHED", "RUNNING"})
@@ -57,7 +58,34 @@ def _record_latency_sample(
 
 
 def _get_owner_escalations(db: StateDB, *, goal_id: str | None = None) -> list[dict[str, Any]]:
-    events = db.list_events(goal_id=goal_id, since_seq=0, limit=500)
+    conn = getattr(db, "_conn", None)
+    db_lock = getattr(db, "_lock", None)
+    if conn is not None and db_lock is not None:
+        with db_lock:
+            if goal_id is not None:
+                rows = conn.execute(
+                    "SELECT seq, ts, goal_id, hypothesis_id, payload_json FROM events "
+                    "WHERE event_type = 'OWNER_ESCALATION' AND goal_id = ? ORDER BY seq ASC LIMIT 500",
+                    (goal_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT seq, ts, goal_id, hypothesis_id, payload_json FROM events "
+                    "WHERE event_type = 'OWNER_ESCALATION' ORDER BY seq ASC LIMIT 500"
+                ).fetchall()
+        events = [
+            {
+                "seq": r["seq"],
+                "ts": r["ts"],
+                "goal_id": r["goal_id"],
+                "hypothesis_id": r["hypothesis_id"],
+                "event_type": "OWNER_ESCALATION",
+                "payload": json.loads(r["payload_json"] or "{}"),
+            }
+            for r in rows
+        ]
+    else:
+        events = db.list_events(goal_id=goal_id, since_seq=0, limit=500)
     out: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for ev in events:
@@ -91,6 +119,39 @@ def _open_db(arr_home: str | Path | None, db: StateDB | None) -> tuple[Path, Sta
     return home, StateDB(home), True
 
 
+def _build_subgoals_summary(subgoals: Sequence[SubGoalNode]) -> dict[str, Any]:
+    """Build a compact WAL-backed SubGoal summary dict (counts + per-subgoal essentials)."""
+    counts: dict[str, int] = {
+        "total": len(subgoals),
+        "active": 0,
+        "locked_dep": 0,
+        "paused": 0,
+        "awaiting_apex": 0,
+        "sealed": 0,
+        "merged": 0,
+        "killed": 0,
+    }
+    items: list[dict[str, Any]] = []
+    for sg in subgoals:
+        st_str = str(sg.status.value if hasattr(sg.status, "value") else sg.status)
+        st_key = st_str.strip().lower()
+        counts[st_key] = counts.get(st_key, 0) + 1
+        items.append(
+            {
+                "subgoal_id": sg.subgoal_id,
+                "goal_id": sg.goal_id,
+                "title": sg.title,
+                "kind": sg.kind.value if hasattr(sg.kind, "value") else str(sg.kind),
+                "status": st_str,
+                "local_metric": sg.local_metric,
+                "target_value": sg.target_value,
+                "sealed_sha": sg.sealed_sha,
+                "priority_weight": float(sg.priority_weight),
+            }
+        )
+    return {"counts": counts, "subgoals": items}
+
+
 def get_overview(
     arr_home: str | Path | None = None,
     *,
@@ -105,9 +166,16 @@ def get_overview(
     home, active_db, own_db = _open_db(arr_home, db)
     try:
         goal_records = active_db.list_goal_records()
-        all_tasks = active_db.list_tasks()
-        all_receipts = active_db.list_receipts()
-        all_workflows = active_db.list_workflows()
+        active_goal_ids = [
+            rec["goal"].goal_id for rec in goal_records if str(rec["status"]) == "ACTIVE"
+        ]
+        all_subgoals = (
+            active_db.list_subgoals() if hasattr(active_db, "list_subgoals") else []
+        )
+        subgoals_by_goal: dict[str, list[SubGoalNode]] = {}
+        for sg in all_subgoals:
+            subgoals_by_goal.setdefault(sg.goal_id, []).append(sg)
+        subgoals_summary = _build_subgoals_summary(all_subgoals)
         pending_decisions = active_db.list_decision_requests(status="PENDING")
         running_decisions = active_db.list_decision_requests(status="RUNNING")
         active_leases = active_db.list_active_leases()
@@ -117,35 +185,115 @@ def get_overview(
         active_by_goal: dict[str, int] = {}
         ready_by_goal: dict[str, int] = {}
         failed_by_goal: dict[str, int] = {}
-        blocked_tasks_by_goal: dict[str, list[str]] = {}
-        for t in all_tasks:
-            if t.status in ACTIVE_TASK_STATES:
-                active_by_goal[t.goal_id] = active_by_goal.get(t.goal_id, 0) + 1
-            elif t.status == "READY":
-                ready_by_goal[t.goal_id] = ready_by_goal.get(t.goal_id, 0) + 1
-            elif t.status == "FAILED":
-                failed_by_goal[t.goal_id] = failed_by_goal.get(t.goal_id, 0) + 1
-            elif t.status.startswith("BLOCKED_"):
-                blocked_tasks_by_goal.setdefault(t.goal_id, []).append(t.status)
-
-        all_hyps = active_db.list_hypotheses()
-        hyps_by_goal: dict[str, list[Any]] = {}
+        blocked_tasks_by_goal: dict[str, set[str]] = {}
+        blocked_hyps_by_goal: dict[str, set[str]] = {}
         failure_domains_by_goal: dict[str, dict[str, int]] = {}
-        for h in all_hyps:
-            hyps_by_goal.setdefault(h.goal_id, []).append(h)
-            fd = h.failure_domain.value if isinstance(h.failure_domain, FailureDomain) else str(h.failure_domain)
-            if fd and fd != FailureDomain.NONE.value:
-                gb_fd = failure_domains_by_goal.setdefault(h.goal_id, {})
-                gb_fd[fd] = gb_fd.get(fd, 0) + 1
-
         tokens_by_goal: dict[str, dict[str, int]] = {}
-        for r in all_receipts:
-            bucket = tokens_by_goal.setdefault(
-                r.goal_id, {"in_tokens": 0, "out_tokens": 0, "receipts": 0}
-            )
-            bucket["in_tokens"] += int(r.in_tokens)
-            bucket["out_tokens"] += int(r.out_tokens)
-            bucket["receipts"] += 1
+
+        conn = getattr(active_db, "_conn", None)
+        db_lock = getattr(active_db, "_lock", None)
+        if conn is not None and db_lock is not None:
+            with db_lock:
+                task_rows = conn.execute(
+                    "SELECT goal_id, status, COUNT(*) AS cnt FROM tasks GROUP BY goal_id, status"
+                ).fetchall()
+                workflows_total = int(conn.execute("SELECT COUNT(*) FROM workflows").fetchone()[0])
+                rcpt_rows = conn.execute(
+                    "SELECT goal_id, COALESCE(SUM(in_tokens), 0) AS in_tok, "
+                    "COALESCE(SUM(out_tokens), 0) AS out_tok, COUNT(*) AS cnt "
+                    "FROM evidence_receipts GROUP BY goal_id"
+                ).fetchall()
+                hyp_rows = conn.execute(
+                    "SELECT goal_id, status, json_extract(payload_json, '$.failure_domain') AS fd "
+                    "FROM hypotheses "
+                    "WHERE SUBSTR(status, 1, 8) = 'BLOCKED_' "
+                    "OR (json_extract(payload_json, '$.failure_domain') IS NOT NULL "
+                    "AND UPPER(CAST(json_extract(payload_json, '$.failure_domain') AS TEXT)) != 'NONE')"
+                ).fetchall()
+            for r_t in task_rows:
+                gid = str(r_t["goal_id"] or "")
+                st_str = str(r_t["status"] or "")
+                cnt = int(r_t["cnt"] or 0)
+                if st_str in ACTIVE_TASK_STATES:
+                    active_by_goal[gid] = active_by_goal.get(gid, 0) + cnt
+                elif st_str == "READY":
+                    ready_by_goal[gid] = ready_by_goal.get(gid, 0) + cnt
+                elif st_str == "FAILED":
+                    failed_by_goal[gid] = failed_by_goal.get(gid, 0) + cnt
+                elif st_str.startswith("BLOCKED_"):
+                    blocked_tasks_by_goal.setdefault(gid, set()).add(st_str)
+            for r_rc in rcpt_rows:
+                gid = str(r_rc["goal_id"] or "")
+                tokens_by_goal[gid] = {
+                    "in_tokens": int(r_rc["in_tok"] or 0),
+                    "out_tokens": int(r_rc["out_tok"] or 0),
+                    "receipts": int(r_rc["cnt"] or 0),
+                }
+            for r_h in hyp_rows:
+                gid = str(r_h["goal_id"] or "")
+                hst = str(r_h["status"] or "")
+                if hst.startswith("BLOCKED_"):
+                    blocked_hyps_by_goal.setdefault(gid, set()).add(hst)
+                fd_raw = r_h["fd"]
+                if fd_raw is not None:
+                    fd_norm = str(fd_raw).strip()
+                    try:
+                        fd_val = FailureDomain(fd_norm.upper()).value
+                    except ValueError:
+                        fd_val = fd_norm
+                    if fd_val and fd_val != FailureDomain.NONE.value:
+                        gb_fd = failure_domains_by_goal.setdefault(gid, {})
+                        gb_fd[fd_val] = gb_fd.get(fd_val, 0) + 1
+            eff_receipts_arg = None
+            eff_reviews_arg = None
+            if active_goal_ids:
+                eff_receipts_arg = [
+                    r
+                    for gid in active_goal_ids
+                    for r in active_db.list_receipts(goal_id=gid)
+                ]
+                if hasattr(active_db, "list_review_receipts"):
+                    eff_reviews_arg = [
+                        rv
+                        for gid in active_goal_ids
+                        for rv in active_db.list_review_receipts(goal_id=gid)
+                    ]
+        else:
+            all_tasks = active_db.list_tasks()
+            all_receipts = active_db.list_receipts()
+            all_workflows = active_db.list_workflows()
+            workflows_total = len(all_workflows)
+            for t in all_tasks:
+                if t.status in ACTIVE_TASK_STATES:
+                    active_by_goal[t.goal_id] = active_by_goal.get(t.goal_id, 0) + 1
+                elif t.status == "READY":
+                    ready_by_goal[t.goal_id] = ready_by_goal.get(t.goal_id, 0) + 1
+                elif t.status == "FAILED":
+                    failed_by_goal[t.goal_id] = failed_by_goal.get(t.goal_id, 0) + 1
+                elif t.status.startswith("BLOCKED_"):
+                    blocked_tasks_by_goal.setdefault(t.goal_id, set()).add(t.status)
+
+            for h in active_db.list_hypotheses():
+                if h.status.startswith("BLOCKED_"):
+                    blocked_hyps_by_goal.setdefault(h.goal_id, set()).add(h.status)
+                fd = (
+                    h.failure_domain.value
+                    if isinstance(h.failure_domain, FailureDomain)
+                    else str(h.failure_domain)
+                )
+                if fd and fd != FailureDomain.NONE.value:
+                    gb_fd = failure_domains_by_goal.setdefault(h.goal_id, {})
+                    gb_fd[fd] = gb_fd.get(fd, 0) + 1
+
+            for r in all_receipts:
+                bucket = tokens_by_goal.setdefault(
+                    r.goal_id, {"in_tokens": 0, "out_tokens": 0, "receipts": 0}
+                )
+                bucket["in_tokens"] += int(r.in_tokens)
+                bucket["out_tokens"] += int(r.out_tokens)
+                bucket["receipts"] += 1
+            eff_receipts_arg = all_receipts
+            eff_reviews_arg = None
 
         esc_by_goal: dict[str, list[dict[str, Any]]] = {}
         for esc in escalations:
@@ -239,10 +387,9 @@ def get_overview(
             if waiting_model_cnt > 0 and ready_by_goal.get(g.goal_id, 0) > 0:
                 goal_bottlenecks.append(f"WAITING_FOR_PINNED_MODEL:{waiting_model_cnt}")
 
-            blocked_statuses = set(blocked_tasks_by_goal.get(g.goal_id, []))
-            for h in hyps_by_goal.get(g.goal_id, []):
-                if h.status.startswith("BLOCKED_"):
-                    blocked_statuses.add(h.status)
+            blocked_statuses = set(blocked_tasks_by_goal.get(g.goal_id, ())) | set(
+                blocked_hyps_by_goal.get(g.goal_id, ())
+            )
             for bst in sorted(blocked_statuses):
                 goal_bottlenecks.append(bst)
 
@@ -293,14 +440,27 @@ def get_overview(
                     "waiting_for_pinned_model": waiting_model_cnt,
                     "failure_domains": failure_domains_by_goal.get(g.goal_id, {}),
                     "bottlenecks": goal_bottlenecks,
+                    "subgoals_summary": _build_subgoals_summary(subgoals_by_goal.get(g.goal_id, [])),
                 }
             )
 
-        per_goal_efficiency = compute_per_goal_empirical_efficiency(
-            active_db,
-            goal_records=goal_records,
-            receipts=all_receipts,
-        )
+        if not active_goal_ids:
+            per_goal_efficiency: dict[str, dict[str, Any]] = {}
+        elif len(active_goal_ids) == 1 and conn is not None and db_lock is not None:
+            per_goal_efficiency = compute_per_goal_empirical_efficiency(
+                active_db,
+                goal_id=active_goal_ids[0],
+                goal_records=goal_records,
+                receipts=eff_receipts_arg,
+                reviews=eff_reviews_arg,
+            )
+        else:
+            per_goal_efficiency = compute_per_goal_empirical_efficiency(
+                active_db,
+                goal_records=goal_records,
+                receipts=eff_receipts_arg,
+                reviews=eff_reviews_arg,
+            )
         pings = read_active_foreground_pings(home)
         global_budget = int(global_cfg.get("global_max_tokens_budget", 0) or 0)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -311,14 +471,17 @@ def get_overview(
             "arr_home": str(home),
             "reactor_sock_exists": (home / "reactor.sock").exists(),
             "goals": goal_rows,
+            "subgoals_summary": subgoals_summary,
             "per_goal_empirical_efficiency": per_goal_efficiency,
             "counts": {
                 "goals_total": len(goal_rows),
                 "goals_active": sum(1 for r in goal_rows if r["status"] == "ACTIVE"),
                 "goals_paused": sum(1 for r in goal_rows if r["status"] == "PAUSED"),
+                "subgoals_total": subgoals_summary["counts"]["total"],
+                "subgoals_active": subgoals_summary["counts"]["active"],
                 "tasks_active": sum(active_by_goal.values()),
                 "tasks_ready": sum(ready_by_goal.values()),
-                "workflows_total": len(all_workflows),
+                "workflows_total": workflows_total,
                 "active_leases": len(active_leases),
                 "pending_decisions": len(pending_decisions) + len(running_decisions),
             },
@@ -344,13 +507,14 @@ def inspect_state(
     arr_home: str | Path | None = None,
     *,
     goal_id: str | None = None,
+    subgoal_id: str | None = None,
     hypothesis_id: str | None = None,
     workflow_id: str | None = None,
     db: StateDB | None = None,
     provider: str = "interactive",
     record_ping: bool = True,
 ) -> dict[str, Any]:
-    """Inspect Goal, Hypothesis, or Workflow details in <50ms from SQLite WAL."""
+    """Inspect Goal, SubGoal, Hypothesis, or Workflow details in <50ms from SQLite WAL."""
     t0 = time.perf_counter()
     home, active_db, own_db = _open_db(arr_home, db)
     try:
@@ -385,6 +549,10 @@ def inspect_state(
             exec_plans = active_db.list_execution_plans(hypothesis_id=hypothesis_id)
             rev_receipts = active_db.list_review_receipts(hypothesis_id=hypothesis_id)
             out["hypothesis"] = hyp.to_dict()
+            if hyp.subgoal_id and hasattr(active_db, "get_subgoal"):
+                sg_parent = active_db.get_subgoal(hyp.subgoal_id)
+                if sg_parent is not None:
+                    out["subgoals_summary"] = _build_subgoals_summary([sg_parent])
             out["experiment_plans"] = [ep.to_dict() for ep in exp_plans]
             out["execution_plans"] = [xp.to_dict() for xp in exec_plans]
             out["review_receipts"] = [rv.to_dict() for rv in rev_receipts]
@@ -392,12 +560,42 @@ def inspect_state(
             out["tasks"] = [t.to_dict() for t in tasks]
             out["receipts"] = [r.to_dict() for r in receipts[-20:]]
             out["knowledge"] = knowledge
+        elif subgoal_id is not None:
+            sg = (
+                active_db.get_goal_subgoal(goal_id, subgoal_id)
+                if goal_id and hasattr(active_db, "get_goal_subgoal")
+                else (active_db.get_subgoal(subgoal_id) if hasattr(active_db, "get_subgoal") else None)
+            )
+            if sg is None:
+                raise KeyError(f"Unknown subgoal_id: {subgoal_id}")
+            sg_hyps = active_db.list_hypotheses(goal_id=sg.goal_id, subgoal_id=sg.subgoal_id)
+            sg_hids = {h.hypothesis_id for h in sg_hyps}
+            sg_wfs = [w for w in active_db.list_workflows(goal_id=sg.goal_id) if w.hypothesis_id in sg_hids]
+            sg_tasks = [t for t in active_db.list_tasks(goal_id=sg.goal_id) if t.hypothesis_id in sg_hids]
+            sg_rcpts = [r for r in active_db.list_receipts(goal_id=sg.goal_id) if r.hypothesis_id in sg_hids]
+            sg_decs = active_db.list_decision_requests(
+                goal_id=sg.goal_id, subgoal_id=sg.subgoal_id, limit=30
+            )
+            out["subgoal"] = sg.to_dict()
+            out["subgoals_summary"] = _build_subgoals_summary([sg])
+            out["hypotheses"] = [h.to_dict() for h in sg_hyps]
+            out["workflows"] = [w.to_dict() for w in sg_wfs]
+            out["tasks"] = [t.to_dict() for t in sg_tasks[-50:]]
+            out["recent_receipts"] = [r.to_dict() for r in sg_rcpts[-20:]]
+            out["decision_requests"] = sg_decs
         elif goal_id is not None:
             goal = active_db.get_goal(goal_id)
             if goal is None:
                 raise KeyError(f"Unknown goal_id: {goal_id}")
+            goal_subgoals = (
+                active_db.list_subgoals(goal_id=goal_id)
+                if hasattr(active_db, "list_subgoals")
+                else []
+            )
             out["goal"] = goal.to_dict()
             out["status"] = active_db.get_goal_status(goal_id)
+            out["subgoals"] = [sg.to_dict() for sg in goal_subgoals]
+            out["subgoals_summary"] = _build_subgoals_summary(goal_subgoals)
             out["routing_policy"] = goal.routing_policy
             out["routing_policy_nl"] = goal.routing_policy_nl
             out["versions"] = active_db.list_goal_versions(goal_id)
@@ -414,10 +612,14 @@ def inspect_state(
             out["interventions"] = active_db.list_interventions(goal_id=goal_id, limit=30)
             out["budget"] = active_db.get_goal_token_usage(goal_id)
         else:
+            all_subgoals = (
+                active_db.list_subgoals() if hasattr(active_db, "list_subgoals") else []
+            )
             out["goals"] = [
                 {"status": rec["status"], "goal": rec["goal"].to_dict()}
                 for rec in active_db.list_goal_records()
             ]
+            out["subgoals_summary"] = _build_subgoals_summary(all_subgoals)
             out["global_routing_policy"] = active_db.get_global_config("routing_policy")
             out["workflows"] = [w.to_dict() for w in active_db.list_workflows()[:50]]
             out["review_receipts"] = [rv.to_dict() for rv in active_db.list_review_receipts()[-30:]]
@@ -624,6 +826,32 @@ def build_takeover_brief(
             if rplan is not None and rplan.thesis:
                 lines.append(f"  - Thesis: {rplan.thesis[:90]}")
 
+        subgoals = (
+            active_db.list_subgoals(goal_id=goal_id)
+            if hasattr(active_db, "list_subgoals")
+            else []
+        )
+        subgoals_summary = _build_subgoals_summary(subgoals)
+        if subgoals:
+            c_sg = subgoals_summary["counts"]
+            lines.extend(
+                [
+                    "",
+                    f"## SubGoals (total={c_sg['total']} active={c_sg['active']} sealed={c_sg['sealed']} locked={c_sg['locked_dep']} awaiting={c_sg['awaiting_apex']})",
+                ]
+            )
+            for sg_item in subgoals_summary["subgoals"][:6]:
+                t_tag = (
+                    f"->{sg_item['target_value']}"
+                    if sg_item.get("target_value") is not None
+                    else ""
+                )
+                sha_tag = f" sha={str(sg_item['sealed_sha'])[:8]}" if sg_item.get("sealed_sha") else ""
+                lines.append(
+                    f"- [{sg_item['status']}] `{sg_item['subgoal_id']}` ({sg_item['kind']}, w={sg_item['priority_weight']:.1f}) "
+                    f"`{sg_item['local_metric']}{t_tag}`{sha_tag}: {str(sg_item['title'])[:48]}"
+                )
+
         hyps = active_db.list_hypotheses(goal_id=goal_id)
         confirmed = [h for h in hyps if h.scientific_verdict == ScientificVerdict.CONFIRMED]
         active_h = [
@@ -696,6 +924,7 @@ def build_takeover_brief(
         return {
             "arr_home": str(home),
             "goal_id": goal_id,
+            "subgoals_summary": subgoals_summary,
             "brief_markdown": md,
             "brief_bytes": byte_len,
             "under_3kb": byte_len < 3072,
@@ -883,6 +1112,44 @@ def intervene(
             "target_id": target_id,
             "result": result,
             "reactor_woke": woke,
+            "interactive_latency_ms": round(elapsed_ms, 3),
+        }
+    finally:
+        if own_db:
+            active_db.close()
+
+
+def get_subgoals(
+    arr_home: str | Path | None = None,
+    *,
+    goal_id: str | None = None,
+    status: str | None = None,
+    db: StateDB | None = None,
+    provider: str = "interactive",
+    record_ping: bool = True,
+) -> dict[str, Any]:
+    """Return sub-50ms SubGoal portfolio list and summary counts from SQLite WAL."""
+    t0 = time.perf_counter()
+    home, active_db, own_db = _open_db(arr_home, db)
+    try:
+        if record_ping:
+            record_foreground_ping(home, provider=provider, ttl_s=120.0)
+        eff_status = status.strip().upper() if isinstance(status, str) and status.strip() else None
+        subgoals = (
+            active_db.list_subgoals(goal_id=goal_id, status=eff_status)
+            if hasattr(active_db, "list_subgoals")
+            else []
+        )
+        summary = _build_subgoals_summary(subgoals)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        _record_latency_sample(home, "subgoals", elapsed_ms, provider=provider, record_ping=False)
+        return {
+            "arr_home": str(home),
+            "goal_id": goal_id,
+            "status": status,
+            "counts": summary["counts"],
+            "subgoals": [sg.to_dict() for sg in subgoals],
+            "subgoals_summary": summary,
             "interactive_latency_ms": round(elapsed_ms, 3),
         }
     finally:

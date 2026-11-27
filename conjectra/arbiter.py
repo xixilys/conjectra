@@ -300,18 +300,34 @@ def read_cloud_slot_state(
             p = Path(sp).expanduser()
             if p.is_dir():
                 candidates.extend(sorted(p.glob("cloud_slot_state*.json")))
+                candidates.extend(sorted(p.glob("cloud_runtime*.json")))
             else:
                 candidates.extend(Path(m) for m in sorted(glob.glob(str(p))))
     else:
         default_globs = (
             str(Path.home() / ".cache" / "cloud_slot_state*.json"),
+            str(Path.home() / ".cache" / "cloud_runtime*.json"),
             "/tmp/cloud_slot_state*.json",
+            "/tmp/cloud_runtime*.json",
         )
         for pat in default_globs:
             candidates.extend(Path(m) for m in sorted(glob.glob(pat)))
 
+    seen_keys: set[str] = set()
+    fresh_slots = 0
+    fresh_active = 0
+    fresh_paths: list[str] = []
+    fresh_status: str | None = None
+    fallback_stale: CloudSlotState | None = None
+
     for cand in candidates:
         if not cand.is_file():
+            continue
+        try:
+            resolved_str = str(cand.resolve())
+        except OSError:
+            resolved_str = str(cand)
+        if resolved_str in seen_keys:
             continue
         try:
             doc = json.loads(cand.read_text(encoding="utf-8"))
@@ -319,6 +335,12 @@ def read_cloud_slot_state(
             continue
         if not isinstance(doc, dict):
             continue
+        rt_id = str(doc.get("runtime_id") or doc.get("runtime") or "").strip()
+        dedup_k = f"rt:{rt_id}" if rt_id else f"path:{resolved_str}"
+        if dedup_k in seen_keys:
+            continue
+        seen_keys.add(resolved_str)
+        seen_keys.add(dedup_k)
         try:
             age_s = time.time() - cand.stat().st_mtime
         except OSError:
@@ -328,15 +350,38 @@ def read_cloud_slot_state(
             age_s = max(0.0, time.time() - float(ts))
         stale = age_s > stale_after_s
         status = str(doc.get("status") or ("stale" if stale else "ready")).lower()
-        slots = int(doc.get("available_slots", 1 if (not stale and status in ("ready", "connected", "active", "idle")) else 0))
-        active_jobs = int(doc.get("active_jobs", 0))
-        return CloudSlotState(
-            available_slots=max(0, slots) if not stale else 0,
-            status=status,
-            active_jobs=max(0, active_jobs),
-            raw_path=str(cand),
-            stale=stale,
+        slots = int(
+            doc.get(
+                "available_slots",
+                1 if (not stale and status in ("ready", "connected", "active", "idle")) else 0,
+            )
         )
+        active_jobs = max(0, int(doc.get("active_jobs", 0)))
+        if not stale:
+            fresh_slots += max(0, slots)
+            fresh_active += active_jobs
+            fresh_paths.append(str(cand))
+            if fresh_status is None or status in ("ready", "connected", "active"):
+                fresh_status = status
+        elif fallback_stale is None:
+            fallback_stale = CloudSlotState(
+                available_slots=0,
+                status=status,
+                active_jobs=active_jobs,
+                raw_path=str(cand),
+                stale=True,
+            )
+
+    if fresh_paths:
+        return CloudSlotState(
+            available_slots=fresh_slots,
+            status=fresh_status or "ready",
+            active_jobs=fresh_active,
+            raw_path=",".join(fresh_paths),
+            stale=False,
+        )
+    if fallback_stale is not None:
+        return fallback_stale
     return CloudSlotState(available_slots=0, status="unavailable", active_jobs=0, raw_path=None, stale=True)
 
 
@@ -362,15 +407,36 @@ def read_proc_start_time(pid: int) -> tuple[str, int] | None:
         return None
 
 
-def verify_process_identity(pid: int, expected_start_time: int | None) -> ProcessLiveness:
+def _normalize_expected_start_time(expected_start_time: Any) -> int | None:
+    """Normalize an int or `(state, starttime_ticks)` tuple/list into an int start time."""
+    if expected_start_time is None or isinstance(expected_start_time, bool):
+        return None
+    if isinstance(expected_start_time, (list, tuple)):
+        if len(expected_start_time) >= 2:
+            try:
+                return int(expected_start_time[1])
+            except (TypeError, ValueError):
+                return None
+        return None
+    try:
+        return int(expected_start_time)
+    except (TypeError, ValueError):
+        return None
+
+
+def verify_process_identity(
+    pid: int,
+    expected_start_time: int | Sequence[Any] | None,
+) -> ProcessLiveness:
     """Verify PID existence and /proc/<pid>/stat start time to avoid PID recycling bugs."""
+    norm_expected = _normalize_expected_start_time(expected_start_time)
     parsed = read_proc_start_time(pid)
     if parsed is None:
         return ProcessLiveness(
             pid=pid,
             alive=False,
             state="MISSING",
-            expected_start_time=expected_start_time,
+            expected_start_time=norm_expected,
             actual_start_time=None,
             recycled=False,
         )
@@ -380,16 +446,16 @@ def verify_process_identity(pid: int, expected_start_time: int | None) -> Proces
             pid=pid,
             alive=False,
             state=state,
-            expected_start_time=expected_start_time,
+            expected_start_time=norm_expected,
             actual_start_time=actual_start,
             recycled=False,
         )
-    if expected_start_time is not None and actual_start != expected_start_time:
+    if norm_expected is not None and actual_start != norm_expected:
         return ProcessLiveness(
             pid=pid,
             alive=False,
             state=state,
-            expected_start_time=expected_start_time,
+            expected_start_time=norm_expected,
             actual_start_time=actual_start,
             recycled=True,
         )
@@ -397,7 +463,7 @@ def verify_process_identity(pid: int, expected_start_time: int | None) -> Proces
         pid=pid,
         alive=True,
         state=state,
-        expected_start_time=expected_start_time,
+        expected_start_time=norm_expected,
         actual_start_time=actual_start,
         recycled=False,
     )
@@ -1154,7 +1220,7 @@ class ResourceArbiter:
             if pid is not None:
                 liveness = verify_process_identity(
                     int(pid),
-                    None if expected_start is None else int(expected_start),
+                    expected_start,
                 )
                 item["liveness"] = {
                     "alive": liveness.alive,
