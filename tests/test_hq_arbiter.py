@@ -209,6 +209,7 @@ def test_resource_alias_and_host_detection() -> None:
 
 def test_default_mem_floor_and_testsim_hq_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Default ResourceArbiter enforces 10 GiB (10240 MB) floor on heavy/test/sim stages
+    monkeypatch.delenv("CONJECTRA_MIN_AVAIL_RAM_MB", raising=False)
     arbiter = ResourceArbiter(
         quotas_path=tmp_path / "missing_q.json",
         ledger_path=tmp_path / "missing_l.json",

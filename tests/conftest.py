@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
+# The production default keeps 10 GiB of MemAvailable free before heavy stages start. Hosted CI
+# runners and laptops often have less, which would make every end-to-end test wait for memory.
+# Tests that check the default itself clear this variable explicitly. Subprocesses inherit it.
+os.environ.setdefault("CONJECTRA_MIN_AVAIL_RAM_MB", "256")
+
 from conjectra.adapters import GenericAdapter, compute_hypothesis_fingerprint, register_adapter
 from conjectra.types import FidelityRung, HypothesisKind, HypothesisNode, ResearchGoal
 

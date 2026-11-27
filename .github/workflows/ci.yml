@@ -38,6 +38,10 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Hosted runners have less than the 10 GiB MemAvailable that heavy stages wait for by default.
+      CONJECTRA_MIN_AVAIL_RAM_MB: "256"
     strategy:
       fail-fast: false
       matrix:
