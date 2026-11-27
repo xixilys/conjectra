@@ -217,7 +217,7 @@ def how_it_works(t):
     p.append(box(x, y, w, h, t))
     p.append(text(x + 20, y + 36, "Single-attempt jobs", size=18, fill=t["fg"], weight=700))
     p.append(text(x + 20, y + 60, "isolated git worktree · pinned model · timeout", size=13, fill=t["muted"]))
-    stages = [("CODE", "fg"), ("CPU_GATE", "warn"), ("IMPL_REVIEW", "accent"), ("EXP_SCREEN", "warn"),
+    stages = [("CODE", "accent"), ("CPU_GATE", "warn"), ("IMPL_REVIEW", "accent"), ("EXP_SCREEN", "warn"),
               ("EXP_CONFIRM", "warn"), ("RESULT_REVIEW", "accent")]
     cx0, cy0 = x + 20, y + 80
     for i, (s, k) in enumerate(stages):
@@ -261,11 +261,84 @@ def how_it_works(t):
     return "\n".join(p) + "\n"
 
 
+def pipeline(t):
+    """Stage pipeline: two rows of stages, then the two reconcile outcomes and the feedback loop."""
+    W, H = 960, 330
+    p = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
+        f'aria-label="Stage pipeline: PROPOSE, DESIGN_REVIEW, CODE, CPU_GATE, IMPL_REVIEW, EXP_SCREEN, '
+        f'EXP_CONFIRM, RESULT_REVIEW, RECONCILE; confirmed results spawn ablation and falsification '
+        f'branches, refuted ones go to the graveyard">',
+        "<defs>",
+        f'<marker id="pm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" '
+        f'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{t["muted"]}"/></marker>',
+        "</defs>",
+        f'<rect x="0.5" y="0.5" width="{W - 1}" height="{H - 1}" rx="18" fill="{t["bg0"]}" stroke="{t["border"]}"/>',
+    ]
+    kinds = {"model": ("accent", "accent_soft"), "det": ("warn", "warn_soft"), "seed": ("fg", "card_alt")}
+    h, gap = 38, 34
+
+    def row(items, x, y):
+        spans = []
+        for i, (label, kind) in enumerate(items):
+            fg, bg = kinds[kind]
+            c, w = chip(x, y, label, fg=t[fg], bg=t[bg], size=15, h=h, pad=14)
+            p.append(c)
+            spans.append((x, x + w, y + h / 2))
+            if i < len(items) - 1:
+                p.append(f'<line x1="{x + w + 4}" y1="{y + h / 2}" x2="{x + w + gap - 4}" y2="{y + h / 2}" '
+                         f'stroke="{t["muted"]}" stroke-width="2" marker-end="url(#pm)"/>')
+            x += w + gap
+        return spans
+
+    r1 = row([("PROPOSE", "seed"), ("DESIGN_REVIEW", "model"), ("CODE", "model"), ("CPU_GATE", "det"),
+              ("IMPL_REVIEW", "model")], 40, 64)
+    r2 = row([("EXP_SCREEN", "det"), ("EXP_CONFIRM", "det"), ("RESULT_REVIEW", "model"), ("RECONCILE", "det")],
+             40, 164)
+    # IMPL_REVIEW (end of row 1) down and back to EXP_SCREEN (start of row 2)
+    x_end = (r1[-1][0] + r1[-1][1]) / 2
+    x_start = (r2[0][0] + r2[0][1]) / 2
+    p.append(f'<path d="M {x_end} {64 + h + 2} V 132 H {x_start} V {164 - 4}" fill="none" stroke="{t["muted"]}" '
+             f'stroke-width="2" marker-end="url(#pm)"/>')
+    p.append(text(x_start + 12, 126, "F1 fast screen → F2 full confirm", size=13, fill=t["muted"]))
+
+    # reconcile outcomes
+    rx_right, ry = r2[-1][1], r2[-1][2]
+    ox = rx_right + 56
+    c_ok, w_ok = chip(ox, 128, "CONFIRMED", fg=t["ok"], bg=t["ok_soft"], size=14, h=30)
+    c_bad, w_bad = chip(ox, 200, "REFUTED", fg=t["bad"], bg=t["bad_soft"], size=14, h=30)
+    p += [c_ok, c_bad]
+    p.append(text(ox, 180, "→ ablation + falsification", size=14, fill=t["fg"]))
+    p.append(text(ox, 252, "→ graveyard, blocks repeats", size=14, fill=t["fg"]))
+    for ty in (143, 215):
+        p.append(f'<path d="M {rx_right + 4} {ry} C {rx_right + 30} {ry}, {ox - 30} {ty}, {ox - 4} {ty}" '
+                 f'fill="none" stroke="{t["muted"]}" stroke-width="2" marker-end="url(#pm)"/>')
+    # feedback loop: confirmed -> new hypotheses -> PROPOSE
+    px = (r1[0][0] + r1[0][1]) / 2
+    loop_x = ox + w_ok / 2
+    p.append(f'<path d="M {loop_x} 126 V 36 H {px} V {64 - 4}" fill="none" stroke="{t["ok"]}" stroke-width="2" '
+             f'stroke-dasharray="6 5" marker-end="url(#pm)"/>')
+    p.append(text((loop_x + px) / 2, 28, "new hypotheses", size=13, fill=t["ok"], anchor="middle"))
+
+    # legend
+    ly, x = 280, 40
+    for label, kind, desc in (("model job", "model", "reviews run on a different family than the author"),
+                              ("deterministic", "det", "tests, parsed metrics, ledger")):
+        fg, bg = kinds[kind]
+        c, w = chip(x, ly, label, fg=t[fg], bg=t[bg], size=13, h=26, family=SANS)
+        p.append(c)
+        p.append(text(x + w + 10, ly + 18, desc, size=13, fill=t["muted"]))
+        x += w + 10 + int(len(desc) * 13 * 0.55) + 36
+    p.append("</svg>")
+    return "\n".join(p) + "\n"
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     for name, t in THEMES.items():
         (OUT / f"banner-{name}.svg").write_text(banner(t), encoding="utf-8")
         (OUT / f"how-it-works-{name}.svg").write_text(how_it_works(t), encoding="utf-8")
+        (OUT / f"pipeline-{name}.svg").write_text(pipeline(t), encoding="utf-8")
     print("wrote", sorted(p.name for p in OUT.glob("*.svg")))
 
 

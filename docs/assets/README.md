@@ -4,6 +4,7 @@
 |---|---|---|
 | `banner-{light,dark}.svg` | header banner | `python3 scripts/gen_readme_assets.py` |
 | `how-it-works-{light,dark}.svg` | architecture diagram | `python3 scripts/gen_readme_assets.py` |
+| `pipeline-{light,dark}.svg` | stage pipeline | `python3 scripts/gen_readme_assets.py` |
 | `demo.svg` | animated terminal recording of `./examples/quickstart/run.sh` | see below |
 | `demo.cast` | the asciinema recording `demo.svg` was rendered from | see below |
 
