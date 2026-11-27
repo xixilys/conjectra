@@ -145,18 +145,12 @@ done.
 A hypothesis moves through stages. Each stage is a separate job with its own resources, timeout and
 receipt; retries are new jobs, never in-place re-runs.
 
-```mermaid
-flowchart LR
-    P([PROPOSE]) --> DR[DESIGN_REVIEW] --> C[CODE] --> G{{CPU_GATE}} --> IR[IMPL_REVIEW]
-    IR --> S{{EXP_SCREEN}} --> F{{EXP_CONFIRM}} --> RR[RESULT_REVIEW] --> R{{RECONCILE}}
-    R -- CONFIRMED --> AB([ablation + falsification branches])
-    R -- REFUTED --> GY[(graveyard)]
-    AB -. new hypotheses .-> P
-```
-
-<sub>Rectangles are model jobs (reviews run on a different model family than the author);
-hexagons are deterministic: tests, experiments with parsed metrics, and ledger reconciliation.
-`F1` fast screens come before `F2` full confirmations.</sub>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/pipeline-dark.svg">
+    <img alt="Stage pipeline: PROPOSE, DESIGN_REVIEW, CODE, CPU_GATE, IMPL_REVIEW, then EXP_SCREEN, EXP_CONFIRM, RESULT_REVIEW, RECONCILE. Confirmed results spawn ablation and falsification branches that feed back as new hypotheses; refuted ones go to a graveyard that blocks repeats." src="docs/assets/pipeline-light.svg" width="100%">
+  </picture>
+</p>
 
 Under the hood:
 
