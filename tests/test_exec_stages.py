@@ -952,3 +952,31 @@ def test_p1_03_r3_exec_fence_metrics_schema_and_promotion_lock_path(tmp_path: Pa
         assert lp == arr_home / "locks" / "promote_goal_projgamma_v1_arr_projgamma_h-1.flock"
     finally:
         db.close()
+
+
+def test_vm_stat_parsing_for_macos_mem_available():
+    from conjectra.stage_runner import parse_vm_stat_available_mb
+
+    text = (
+        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+        "Pages free:                                    12800.\n"
+        "Pages active:                                 500000.\n"
+        "Pages inactive:                               51200.\n"
+        "Pages speculative:                              6400.\n"
+        "Pages wired down:                             248854.\n"
+        "Pages purgeable:                                1600.\n"
+    )
+    # (12800 + 51200 + 6400 + 1600) pages * 16 KiB = 1125 MiB; active/wired pages are not available.
+    assert parse_vm_stat_available_mb(text) == 1125
+
+
+def test_hq_runtime_without_hq_binary_fails_only_on_use(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from conjectra import hq_runtime
+
+    monkeypatch.delenv("CONJECTRA_HQ_BIN", raising=False)
+    monkeypatch.setattr(hq_runtime, "DEFAULT_HQ_BIN_CANDIDATES", ())
+    monkeypatch.setattr(hq_runtime.shutil, "which", lambda _name: None)
+    rt = hq_runtime.HQRuntime(tmp_path / "home")  # inline mode constructs this; it must not raise
+    assert rt.hq_bin is None
+    with pytest.raises(FileNotFoundError, match="HyperQueue binary"):
+        rt._base_cmd()

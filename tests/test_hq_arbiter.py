@@ -680,3 +680,13 @@ def test_p1_04_r4_hq_query_job_list_fail_closed_disambiguation(
         lambda args, **_kw: subprocess.CompletedProcess(args, 0, stdout='{"not": "a_list"}', stderr=""),
     )
     assert hq.query_job_list(all_jobs=True)["lookup_status"] == "QUERY_ERROR"
+
+
+def test_disk_high_water_mark_env_override(monkeypatch):
+    from conjectra.arbiter import ResourceArbiter
+
+    monkeypatch.delenv("CONJECTRA_DISK_MAX_PCT", raising=False)
+    assert ResourceArbiter().disk_max_pct == 85.0
+    monkeypatch.setenv("CONJECTRA_DISK_MAX_PCT", "97.5")
+    assert ResourceArbiter().disk_max_pct == 97.5
+    assert ResourceArbiter(disk_max_pct=70).disk_max_pct == 70.0

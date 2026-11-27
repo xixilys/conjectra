@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 340" width="1280" height="340" role="img" aria-label="Conjectra: hypotheses in, audited evidence out">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0d1117"/><stop offset="1" stop-color="#1a1640"/></linearGradient>
+<filter id="sh" x="-10%" y="-10%" width="120%" height="140%"><feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#000000" flood-opacity="0.5"/></filter>
+</defs>
+<rect x="0.5" y="0.5" width="1279" height="339" rx="20" fill="url(#bg)" stroke="#30363d"/>
+<path d="M 159.0 182.0 A 52 52 0 1 1 159.0 118.0" fill="none" stroke="#9d8cff" stroke-width="13.5" stroke-linecap="round"/><circle cx="118" cy="150" r="11.4" fill="#9d8cff" opacity="0.9"/><circle cx="176.2" cy="128.2" r="7.8" fill="#3fb950"/><circle cx="176.2" cy="150.0" r="7.8" fill="#f85149"/><circle cx="176.2" cy="171.8" r="7.8" fill="#9198a1"/>
+<text x="206" y="150" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="70" font-weight="700" fill="#e6edf3" text-anchor="start" letter-spacing="-1.5">Conjectra</text>
+<text x="210" y="196" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="27" font-weight="600" fill="#9d8cff" text-anchor="start" >Hypotheses in, audited evidence out.</text>
+<text x="210" y="232" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="400" fill="#9198a1" text-anchor="start" >A zero-token control plane for multi-goal autonomous research.</text>
+<rect x="210" y="272" width="145" height="26" rx="13.0" fill="#2a2459" stroke="#9d8cff" stroke-opacity="0.35"/><text x="282.5" y="289.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9d8cff" text-anchor="middle" >0-token controller</text>
+<rect x="363" y="272" width="159" height="26" rx="13.0" fill="#2a2459" stroke="#9d8cff" stroke-opacity="0.35"/><text x="442.5" y="289.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9d8cff" text-anchor="middle" >many goals, one pool</text>
+<rect x="530" y="272" width="159" height="26" rx="13.0" fill="#2a2459" stroke="#9d8cff" stroke-opacity="0.35"/><text x="609.5" y="289.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9d8cff" text-anchor="middle" >fenced human control</text>
+<rect x="697" y="272" width="124" height="26" rx="13.0" fill="#2a2459" stroke="#9d8cff" stroke-opacity="0.35"/><text x="759.0" y="289.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9d8cff" text-anchor="middle" >&lt; 3 KB hand-off</text>
+<g filter="url(#sh)"><rect x="868" y="50" width="352" height="240" rx="14" fill="#161b22" stroke="#30363d"/></g>
+<rect x="868" y="50" width="352" height="40" rx="14" fill="#0d1117"/>
+<rect x="868" y="76" width="352" height="14" fill="#0d1117"/>
+<line x1="868" y1="90" x2="1220" y2="90" stroke="#30363d"/>
+<text x="886" y="76" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#e6edf3" text-anchor="start" >EvidenceReceipt</text>
+<text x="1202" y="76" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="400" fill="#9198a1" text-anchor="end" >EXP_CONFIRM</text>
+<text x="886" y="130" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="400" fill="#9198a1" text-anchor="start" >engineering</text>
+<rect x="1149.76" y="112" width="52" height="26" rx="13.0" fill="#12261e" stroke="#3fb950" stroke-opacity="0.35"/><text x="1175.76" y="129.68" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="600" fill="#3fb950" text-anchor="middle" >PASS</text>
+<text x="886" y="170" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="400" fill="#9198a1" text-anchor="start" >scientific</text>
+<rect x="1109.46" y="152" width="92" height="26" rx="13.0" fill="#12261e" stroke="#3fb950" stroke-opacity="0.35"/><text x="1155.46" y="169.68" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="600" fill="#3fb950" text-anchor="middle" >CONFIRMED</text>
+<text x="886" y="210" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="400" fill="#9198a1" text-anchor="start" >audit</text>
+<rect x="1149.76" y="192" width="52" height="26" rx="13.0" fill="#12261e" stroke="#3fb950" stroke-opacity="0.35"/><text x="1175.76" y="209.68" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="600" fill="#3fb950" text-anchor="middle" >PASS</text>
+<text x="886" y="250" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="400" fill="#9198a1" text-anchor="start" >failure_domain</text>
+<rect x="1149.76" y="232" width="52" height="26" rx="13.0" fill="#21262d" stroke="#9198a1" stroke-opacity="0.35"/><text x="1175.76" y="249.68" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="600" fill="#9198a1" text-anchor="middle" >NONE</text>
+</svg>

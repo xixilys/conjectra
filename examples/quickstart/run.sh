@@ -25,6 +25,8 @@ export CONJECTRA_WORKTREE_ROOT="$WORK/worktrees"
 # The default host guard waits for 10 GiB of free RAM before test/experiment stages; the toy
 # repo needs almost nothing, so relax it for laptops and small CI runners.
 export CONJECTRA_MIN_AVAIL_RAM_MB="${CONJECTRA_MIN_AVAIL_RAM_MB:-512}"
+# Likewise the disk guard refuses new stages once `/` is 85 % full; the demo writes a few MB.
+export CONJECTRA_DISK_MAX_PCT="${CONJECTRA_DISK_MAX_PCT:-99}"
 # Every model call goes to a tiny offline plugin backend (examples/quickstart/toy_backend.py):
 # write calls bump the Newton iteration count, review calls return a structured PASS.
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"

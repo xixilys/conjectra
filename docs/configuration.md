@@ -36,6 +36,7 @@ environment variable or a JSON file you point it at.
 | Variable | Default | Purpose |
 |---|---|---|
 | `CONJECTRA_MIN_AVAIL_RAM_MB` | `10240` | test/experiment stages wait for this much `MemAvailable`. **Lower it on laptops / small CI runners.** |
+| `CONJECTRA_DISK_MAX_PCT` | `85` | no new stage is admitted while a watched mount (see `CONJECTRA_DISK_MOUNTS`) is at least this full |
 | `CONJECTRA_MIN_GPU_VRAM_MB` | `1500` | free VRAM required before GPU stages start |
 
 ### Models and backends

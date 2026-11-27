@@ -519,7 +519,7 @@ class ResourceArbiter:
         gemini_quota_path: Path | str | None = None,
         telemetry_script: Path | str | None = None,
         disk_mounts: Sequence[str | Path] = DEFAULT_DISK_MOUNTS,
-        disk_max_pct: float = 85.0,
+        disk_max_pct: float | None = None,
         min_ram_floor_mb: int | None = None,
         max_load1: float = 32.0,
         min_gpu_free_mb: int = 2048,
@@ -543,6 +543,8 @@ class ResourceArbiter:
         self.gemini_quota_path = Path(gemini_quota_path or (_CONFIG_DIR / "gemini-quota.json"))
         self.telemetry_script = Path(telemetry_script) if telemetry_script else _CONFIG_DIR / "quota_telemetry.py"
         self.disk_mounts = tuple(disk_mounts)
+        if disk_max_pct is None:
+            disk_max_pct = float(os.environ.get("CONJECTRA_DISK_MAX_PCT", "85"))
         self.disk_max_pct = float(disk_max_pct)
         self._explicit_min_ram_floor_mb = None if min_ram_floor_mb is None else int(min_ram_floor_mb)
         self.min_ram_floor_mb = 2048 if min_ram_floor_mb is None else int(min_ram_floor_mb)

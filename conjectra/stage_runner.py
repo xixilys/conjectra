@@ -69,11 +69,29 @@ PROTECTED_BRANCHES = frozenset({"main", "master", "refs/heads/main", "refs/heads
 _MEM_AVAIL_RE = re.compile(r"^MemAvailable:\s+(\d+)\s+kB$", re.MULTILINE)
 
 
+_VM_STAT_PAGE_RE = re.compile(r"page size of (\d+) bytes")
+_VM_STAT_LINE_RE = re.compile(r"^Pages (free|inactive|speculative|purgeable):\s+(\d+)\.?$", re.MULTILINE)
+
+
+def parse_vm_stat_available_mb(text: str) -> int:
+    """Approximate available memory (MiB) from macOS `vm_stat` output: free + inactive + speculative + purgeable."""
+    page_m = _VM_STAT_PAGE_RE.search(text)
+    page_size = int(page_m.group(1)) if page_m else 4096
+    pages = sum(int(n) for _kind, n in _VM_STAT_LINE_RE.findall(text))
+    return (pages * page_size) // (1024 * 1024)
+
+
 def read_mem_available_mb(meminfo_path: Path = Path("/proc/meminfo")) -> int:
-    """Read MemAvailable from /proc/meminfo in MiB (returns 0 if unreadable)."""
+    """Read MemAvailable in MiB from /proc/meminfo, or `vm_stat` on macOS (returns 0 if unreadable)."""
     try:
         text = meminfo_path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
+        if sys.platform == "darwin" and meminfo_path == Path("/proc/meminfo"):
+            try:
+                proc = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5, check=False)
+            except (OSError, subprocess.SubprocessError):
+                return 0
+            return parse_vm_stat_available_mb(proc.stdout) if proc.returncode == 0 else 0
         return 0
     m = _MEM_AVAIL_RE.search(text)
     if not m:
