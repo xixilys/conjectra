@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conjectra-echo-backend"
+version = "0.1.0"
+description = "Example conjectra backend plugin (rule-based reviewer, scripted builder)"
+requires-python = ">=3.10"
+dependencies = ["conjectra"]
+
+# This is all it takes to make the backend discoverable:
+[project.entry-points."conjectra.backends"]
+compile_check = "conjectra_echo_backend:CompileCheckBackend"
+
+[tool.setuptools]
+packages = ["conjectra_echo_backend"]

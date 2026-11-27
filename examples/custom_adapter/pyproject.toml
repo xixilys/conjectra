@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conjectra-csv-adapter"
+version = "0.1.0"
+description = "Example conjectra project adapter reading metrics from results.csv"
+requires-python = ">=3.10"
+dependencies = ["conjectra"]
+
+[project.entry-points."conjectra.adapters"]
+csv_metrics = "conjectra_csv_adapter:CsvMetricsAdapter"
+
+[tool.setuptools]
+packages = ["conjectra_csv_adapter"]

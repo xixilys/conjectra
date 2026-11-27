@@ -1,0 +1,539 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Default provider catalog for conjectra. Copy this file, edit it, and point CONJECTRA_PROVIDERS at your copy. Model ids are examples; set them to whatever your CLIs or gateways actually accept.",
+  "hq_resource_mapping": {
+    "llm_claude": "llmclaude",
+    "llm_codex_audit": "llmcodexaudit",
+    "llm_gemini": "llmgemini",
+    "llm_deepseek": "llmdeepseek"
+  },
+  "default_role_routing": {
+    "research_director": [
+      "claude-opus-5-5:high",
+      "gpt-5-pro:high",
+      "gemini-pro:high"
+    ],
+    "theorist": [
+      "claude-opus-5-5:high",
+      "gpt-5-pro:high",
+      "gemini-pro:high"
+    ],
+    "research_lead": [
+      "gpt-5-codex:high",
+      "gemini-flash:high",
+      "gemini-pro:high",
+      "claude-sonnet-5-5:medium"
+    ],
+    "experiment_designer": [
+      "gpt-5-codex:high",
+      "gemini-flash:high",
+      "gemini-pro:high",
+      "claude-sonnet-5-5:medium"
+    ],
+    "design_reviewer": [
+      "gpt-5-codex:high",
+      "gemini-pro:high",
+      "grok-code-fast:high",
+      "claude-sonnet-5-5:medium",
+      "deepseek-chat:high"
+    ],
+    "impl_reviewer": [
+      "gpt-5-codex:high",
+      "gemini-pro:high",
+      "grok-code-fast:high",
+      "claude-sonnet-5-5:medium",
+      "deepseek-chat:high"
+    ],
+    "result_auditor": [
+      "gpt-5-codex:high",
+      "gemini-pro:high",
+      "grok-code-fast:high",
+      "claude-sonnet-5-5:medium",
+      "deepseek-chat:high"
+    ],
+    "engineer_builder": [
+      "claude-sonnet-5-5:medium",
+      "gemini-pro:high",
+      "deepseek-chat:high",
+      "gpt-5-codex:high",
+      "gemini-flash:high"
+    ]
+  },
+  "banned_channels": [
+    "untrusted-relay"
+  ],
+  "providers": {
+    "claude-opus-5-5": {
+      "canonical_model": "claude-opus-5-5",
+      "pool": "claude",
+      "logical_pool": "llm_claude",
+      "hq_resource": "llmclaude",
+      "family": "anthropic",
+      "native_cli_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high",
+      "multipool_effort_map": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max"
+      },
+      "aliases": [
+        "claude-opus",
+        "claude-opus-5-5",
+        "opus",
+        "opus-5-5"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ]
+    },
+    "claude-sonnet-5-5": {
+      "canonical_model": "claude-sonnet-5-5",
+      "pool": "claude",
+      "logical_pool": "llm_claude",
+      "hq_resource": "llmclaude",
+      "family": "anthropic",
+      "native_cli_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "medium"
+      ],
+      "default_effort": "medium",
+      "multipool_effort_map": {
+        "low": "low",
+        "medium": "medium",
+        "high": "medium",
+        "xhigh": "medium",
+        "max": "medium"
+      },
+      "aliases": [
+        "claude-sonnet",
+        "claude-sonnet-5-5",
+        "sonnet",
+        "sonnet-5-5"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ]
+    },
+    "gpt-5-codex": {
+      "canonical_model": "gpt-5-codex",
+      "pool": "codex",
+      "logical_pool": "llm_codex_audit",
+      "hq_resource": "llmcodexaudit",
+      "family": "openai",
+      "native_cli_efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high",
+      "multipool_effort_map": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max"
+      },
+      "aliases": [
+        "gpt-5-codex"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ]
+    },
+    "gpt-5-pro": {
+      "canonical_model": "gpt-5-pro",
+      "pool": "codex",
+      "logical_pool": "llm_codex_audit",
+      "hq_resource": "llmcodexaudit",
+      "family": "openai",
+      "native_cli_efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high",
+      "multipool_effort_map": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max"
+      },
+      "aliases": [
+        "gpt-5-pro"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ]
+    },
+    "gemini-ultra": {
+      "canonical_model": "gemini-ultra",
+      "pool": "gemini",
+      "logical_pool": "llm_gemini",
+      "hq_resource": "llmgemini",
+      "family": "google",
+      "native_cli_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "high",
+      "multipool_effort_map": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high"
+      },
+      "aliases": [
+        "gemini-ultra",
+        "gemini-ultra-low",
+        "gemini-ultra-medium"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ],
+      "effort_model_ids": {
+        "low": "gemini-ultra-low",
+        "medium": "gemini-ultra-medium",
+        "high": "gemini-ultra"
+      }
+    },
+    "gemini-pro": {
+      "canonical_model": "gemini-pro",
+      "pool": "gemini",
+      "logical_pool": "llm_gemini",
+      "hq_resource": "llmgemini",
+      "family": "google",
+      "native_cli_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "high",
+      "multipool_effort_map": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "xhigh"
+      },
+      "aliases": [
+        "gemini-pro",
+        "gemini-pro-low",
+        "gemini-pro-medium",
+        "gemini-pro-xhigh"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ],
+      "effort_model_ids": {
+        "low": "gemini-pro-low",
+        "medium": "gemini-pro-medium",
+        "high": "gemini-pro",
+        "xhigh": "gemini-pro-xhigh"
+      }
+    },
+    "gemini-flash": {
+      "canonical_model": "gemini-flash",
+      "pool": "gemini",
+      "logical_pool": "llm_gemini",
+      "hq_resource": "llmgemini",
+      "family": "google",
+      "native_cli_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "high",
+      "multipool_effort_map": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "xhigh"
+      },
+      "aliases": [
+        "flash",
+        "gemini-flash",
+        "gemini-flash-low",
+        "gemini-flash-medium",
+        "gemini-flash-xhigh"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ],
+      "effort_model_ids": {
+        "low": "gemini-flash-low",
+        "medium": "gemini-flash-medium",
+        "high": "gemini-flash",
+        "xhigh": "gemini-flash-xhigh"
+      }
+    },
+    "deepseek-chat": {
+      "canonical_model": "deepseek-chat",
+      "pool": "deepseek",
+      "logical_pool": "llm_deepseek",
+      "hq_resource": "llmdeepseek",
+      "family": "deepseek",
+      "native_cli_efforts": [
+        "off",
+        "low",
+        "high",
+        "max"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default_effort": "high",
+      "multipool_effort_map": {
+        "low": "low",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max"
+      },
+      "aliases": [
+        "deepseek",
+        "deepseek-chat"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ]
+    },
+    "grok-code-fast": {
+      "canonical_model": "grok-code-fast",
+      "pool": "grok",
+      "logical_pool": "llm_deepseek",
+      "hq_resource": "llmdeepseek",
+      "family": "xai",
+      "native_cli_efforts": [
+        "high"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "high"
+      ],
+      "default_effort": "high",
+      "multipool_effort_map": {
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high"
+      },
+      "aliases": [
+        "grok",
+        "grok-code-fast"
+      ],
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ]
+    },
+    "deepseek-local": {
+      "canonical_model": "deepseek-local",
+      "pool": "deepseek-local",
+      "logical_pool": "deepseek_local",
+      "hq_resource": "llmdeepseek",
+      "family": "deepseek",
+      "enabled_by_default": false,
+      "native_cli_efforts": [],
+      "multipool_argparse_efforts": [],
+      "policy_allowed_efforts": [],
+      "default_effort": "default",
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ],
+      "display_name": "Self-hosted DeepSeek-compatible endpoint (disabled by default)"
+    },
+    "webchat-gpt-xhigh": {
+      "canonical_model": "Extra High",
+      "display_name": "Web chat UI automation (plugin-provided backend, e.g. a browser automation hub)",
+      "pool": "webchat",
+      "logical_pool": "web_chat_audit",
+      "hq_resource": null,
+      "family": "openai",
+      "native_cli_efforts": [
+        "Instant",
+        "Medium",
+        "High",
+        "Extra High"
+      ],
+      "policy_allowed_efforts": [
+        "Extra High"
+      ],
+      "default_effort": "Extra High",
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ]
+    },
+    "fake": {
+      "canonical_model": "fake-model",
+      "pool": "fake",
+      "logical_pool": "llm_fake",
+      "hq_resource": null,
+      "family": "fake",
+      "backend": "fake",
+      "allowed_execution_hosts": [
+        "local",
+        "remote"
+      ],
+      "native_cli_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "multipool_argparse_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "policy_allowed_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high",
+      "enabled_by_default": false,
+      "aliases": [
+        "fake",
+        "fake-model"
+      ],
+      "display_name": "Deterministic offline backend for tests, demos and CI"
+    }
+  }
+}

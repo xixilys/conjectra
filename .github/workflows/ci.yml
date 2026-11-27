@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  HQ_VERSION: v0.27.0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks git --no-banner --redact -c .gitleaks.toml .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install HyperQueue
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL "https://github.com/It4innovations/hyperqueue/releases/download/${HQ_VERSION}/hq-${HQ_VERSION}-linux-x64.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin" hq
+          "$HOME/.local/bin/hq" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Configure git identity for sandbox commits
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "conjectra-ci"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+      - name: Quickstart example (offline, no HyperQueue)
+        run: ./examples/quickstart/run.sh

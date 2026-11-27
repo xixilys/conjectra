@@ -1,0 +1,8 @@
+# gitleaks configuration: default rules + allowlist for known false positives.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures use idempotency keys that look like API keys to the generic rule"
+regexTarget = "line"
+regexes = ['''idempotency_key\s*=\s*["'][A-Za-z0-9_\-]+["']''']

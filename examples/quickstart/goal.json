@@ -1,0 +1,16 @@
+{
+  "goal_id": "demo-score",
+  "project": "toy",
+  "title": "Improve the sqrt(2) approximation score",
+  "direction": "maximize",
+  "primary_metric": "score",
+  "baseline_value": 0.5,
+  "baseline_sha": "__SHA__",
+  "repo_path": "__REPO__",
+  "kill_criteria": ["tests_passed == 0"],
+  "banned_paths": ["sealed_eval/"],
+  "writable_prefixes": ["src"],
+  "max_tokens_budget": 100000,
+  "max_concurrent_branches": 2,
+  "adapter_name": "generic"
+}

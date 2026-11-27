@@ -1,0 +1,18 @@
+{
+  "goal_id": "demo-score",
+  "proposals": [
+    {
+      "kind": "PARAMETER_RACE",
+      "title": "More Newton iterations",
+      "statement": "Raising iterations from 2 to 4 increases score above the 0.5 baseline.",
+      "mechanism": "newton_iterations_race",
+      "fidelity": "F1_FAST_SCREEN",
+      "writable_paths": ["src"],
+      "params": {"iterations": 4},
+      "kill_criteria": ["tests_passed == 0"],
+      "acceptance_cmd": "python3 -m pytest -q",
+      "screen_cmd": "python3 -m pytest -q",
+      "confirm_cmd": "python3 -m pytest -q"
+    }
+  ]
+}
